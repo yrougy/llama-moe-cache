@@ -2813,6 +2813,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_CACHE_STATIC"));
     add_opt(common_arg(
+        {"--moe-cache-pin-mib"}, "N",
+        "fault the experts of the cached MoE layers that are not resident into RAM, and lock the hottest N MiB of them "
+        "so they can never be evicted (default: 0, requires --moe-profile and --moe-cache-static)\n"
+        "(example: --moe-cache-pin-mib 1990)",
+        [](common_params & params, int value) {
+            params.moe_cache_pin_mib = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_CACHE_PIN_MIB"));
+    add_opt(common_arg(
         {"--moe-stats"}, "FILE",
         "write the per-(layer,expert) MoE selection counts and cache residency to this CSV file when the context is destroyed, "
         "requires --moe-cache-mib (default: disabled)\n"

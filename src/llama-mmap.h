@@ -58,7 +58,20 @@ struct llama_mmap {
 
     void unmap_fragment(size_t first, size_t last);
 
+    // fault in the pages covering [first, last) so the decode hot path does not have to read them from disk
+    void populate(size_t first, size_t last);
+
+    // lock the pages covering [first, last) so they can never be evicted from RAM, false if the limit is reached
+    bool pin(size_t first, size_t last);
+
+    // drop the pages covering [first, last) from the page cache, the mapping stays valid
+    void release(size_t first, size_t last);
+
     static const bool SUPPORTED;
+
+    // MADV_POPULATE_READ is Linux 5.14+, mlock is bounded by RLIMIT_MEMLOCK
+    static const bool POPULATE_SUPPORTED;
+    static const bool PIN_SUPPORTED;
 
 private:
     struct impl;

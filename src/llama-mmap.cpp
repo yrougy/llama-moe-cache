@@ -576,6 +576,55 @@ struct llama_mmap::impl {
         mapped_fragments = std::move(new_mapped_fragments);
     }
 
+    // page-aligned [first, last) clamped to the file, the whole range is covered
+    static void align_full(size_t * first, size_t * last, size_t size) {
+        const size_t page_size = sysconf(_SC_PAGESIZE);
+        *first = *first & ~(page_size - 1);
+        *last  = std::min((*last + page_size - 1) & ~(page_size - 1), size);
+    }
+
+    void populate(size_t first, size_t last) {
+        align_full(&first, &last, size);
+        const size_t len = last - first;
+        if (len == 0) {
+            return;
+        }
+#ifdef MADV_POPULATE_READ
+        if (madvise((char *) addr + first, len, MADV_POPULATE_READ)) {
+            LLAMA_LOG_WARN("warning: madvise(MADV_POPULATE_READ) failed: %s\n", strerror(errno));
+        }
+#else
+        if (posix_madvise((char *) addr + first, len, POSIX_MADV_WILLNEED)) {
+            LLAMA_LOG_WARN("warning: posix_madvise(.., POSIX_MADV_WILLNEED) failed: %s\n", strerror(errno));
+        }
+#endif
+    }
+
+    bool pin(size_t first, size_t last) {
+        align_full(&first, &last, size);
+        const size_t len = last - first;
+        if (len == 0) {
+            return true;
+        }
+        if (mlock((char *) addr + first, len)) {
+            LLAMA_LOG_WARN("warning: mlock failed on a %zu-byte range: %s\n", len, strerror(errno));
+            return false;
+        }
+        return true;
+    }
+
+    // drop the pages from the page cache, the mapping stays valid so a later read re-faults from disk
+    void release(size_t first, size_t last) {
+        align_full(&first, &last, size);
+        const size_t len = last - first;
+        if (len == 0) {
+            return;
+        }
+        if (madvise((char *) addr + first, len, MADV_DONTNEED)) {
+            LLAMA_LOG_WARN("warning: madvise(MADV_DONTNEED) failed on a %zu-byte range: %s\n", len, strerror(errno));
+        }
+    }
+
     ~impl() {
         for (const auto & frag : mapped_fragments) {
             if (munmap((char *) addr + frag.first, frag.second - frag.first)) {
@@ -640,6 +689,29 @@ struct llama_mmap::impl {
         GGML_UNUSED(last);
     }
 
+    void populate(size_t first, size_t last) {
+        GGML_UNUSED(first);
+        GGML_UNUSED(last);
+    }
+
+    bool pin(size_t first, size_t last) {
+        const size_t len = last - first;
+        if (len == 0) {
+            return true;
+        }
+        if (!VirtualLock((char *) addr + first, len)) {
+            LLAMA_LOG_WARN("warning: VirtualLock failed on a %zu-byte range: %s\n",
+                    len, llama_format_win_err(GetLastError()).c_str());
+            return false;
+        }
+        return true;
+    }
+
+    void release(size_t first, size_t last) {
+        GGML_UNUSED(first);
+        GGML_UNUSED(last);
+    }
+
     ~impl() {
         if (hMapping) {
             if (addr) {
@@ -670,6 +742,27 @@ struct llama_mmap::impl {
 
         throw std::runtime_error("mmap not supported");
     }
+
+    void populate(size_t first, size_t last) {
+        GGML_UNUSED(first);
+        GGML_UNUSED(last);
+
+        throw std::runtime_error("mmap not supported");
+    }
+
+    bool pin(size_t first, size_t last) {
+        GGML_UNUSED(first);
+        GGML_UNUSED(last);
+
+        throw std::runtime_error("mmap not supported");
+    }
+
+    void release(size_t first, size_t last) {
+        GGML_UNUSED(first);
+        GGML_UNUSED(last);
+
+        throw std::runtime_error("mmap not supported");
+    }
 #endif
 
     void * addr;
@@ -685,10 +778,26 @@ void * llama_mmap::addr() const { return pimpl->addr; }
 
 void llama_mmap::unmap_fragment(size_t first, size_t last) { pimpl->unmap_fragment(first, last); }
 
+void llama_mmap::populate(size_t first, size_t last) { pimpl->populate(first, last); }
+bool llama_mmap::pin(size_t first, size_t last) { return pimpl->pin(first, last); }
+void llama_mmap::release(size_t first, size_t last) { pimpl->release(first, last); }
+
 #if defined(_POSIX_MEMLOCK_RANGE) || defined(_WIN32)
 const bool llama_mmap::SUPPORTED  = true;
 #else
 const bool llama_mmap::SUPPORTED  = false;
+#endif
+
+#if defined(MADV_POPULATE_READ)
+const bool llama_mmap::POPULATE_SUPPORTED = true;
+#else
+const bool llama_mmap::POPULATE_SUPPORTED = false;
+#endif
+
+#if defined(_POSIX_MEMLOCK_RANGE) || defined(_WIN32)
+const bool llama_mmap::PIN_SUPPORTED = true;
+#else
+const bool llama_mmap::PIN_SUPPORTED = false;
 #endif
 
 // llama_mlock

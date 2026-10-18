@@ -601,6 +601,8 @@ struct common_params {
 
     bool moe_cache_static = false; // keep the experts seeded from moe_profile resident, the misses use the scratch slots
 
+    int64_t moe_cache_pin_mib = 0; // MiB of the hottest non-resident experts locked in RAM, 0 = only fault them in
+
     std::string moe_stats; // write the per-(layer,expert) selection counts and residency of the MoE cache to this CSV file, empty = disabled
 
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;

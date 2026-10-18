@@ -404,6 +404,8 @@ extern "C" {
 
         bool moe_cache_static; // keep the experts seeded from moe_profile resident, the misses go to the scratch slots [EXPERIMENTAL]
 
+        int64_t moe_cache_pin_mib; // MiB of the hottest non-resident experts locked in RAM so they are never evicted, 0 = only fault them in [EXPERIMENTAL]
+
         const char * moe_stats; // write the per-(layer,expert) selection counts and residency of the MoE cache to this CSV file at context destruction, NULL = disabled [EXPERIMENTAL]
 
         // Abort callback

@@ -2379,6 +2379,19 @@ bool llama_model::has_tensor_overrides() const {
     return pimpl->has_tensor_overrides;
 }
 
+llama_mmap * llama_model::mmap_range(const ggml_tensor * t, size_t & first, size_t & last) const {
+    const uint8_t * data = (const uint8_t *) t->data;
+    for (auto & m : pimpl->mappings) {
+        const uint8_t * base = (const uint8_t *) m->addr();
+        if (data >= base && data < base + m->size()) {
+            first = data - base;
+            last  = first + ggml_nbytes(t);
+            return m.get();
+        }
+    }
+    return nullptr;
+}
+
 const ggml_tensor * llama_model::get_tensor(const char * name) const {
     auto it = std::find_if(tensors_by_name.begin(), tensors_by_name.end(),
             [name](const std::pair<std::string, ggml_tensor *> & it) {

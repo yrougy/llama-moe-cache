@@ -17,6 +17,7 @@
 struct llama_cparams;
 struct llama_ubatch;
 struct llama_model_loader;
+struct llama_mmap;
 struct llama_model;
 
 // available models
@@ -785,6 +786,9 @@ struct llama_model {
     ggml_backend_buffer_type_t select_buft(int il) const;
 
     bool has_tensor_overrides() const;
+
+    // the mmap'ed GGUF holding the data of a tensor, plus the file range [first, last) of that tensor, nullptr if the tensor is not mmap'ed
+    llama_mmap * mmap_range(const struct ggml_tensor * t, size_t & first, size_t & last) const;
 
     const struct ggml_tensor * get_tensor(const char * name) const;
 

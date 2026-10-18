@@ -302,6 +302,7 @@ llama_context::llama_context(
     cparams.moe_profile_output = params.moe_profile_output ? params.moe_profile_output : std::string();
     cparams.moe_profile        = params.moe_profile        ? params.moe_profile        : std::string();
     cparams.moe_cache_static   = params.moe_cache_static;
+    cparams.moe_cache_pin_mib  = params.moe_cache_pin_mib;
     cparams.moe_stats          = params.moe_stats ? params.moe_stats : std::string();
 
     // initialized later
@@ -494,7 +495,7 @@ llama_context::llama_context(
 
         if (cparams.moe_cache_size > 0) {
             moe_cache = std::make_unique<llama_moe_cache>(model, backend_ptrs, backend_buft, cparams.moe_cache_size,
-                    cparams.moe_profile, cparams.moe_cache_static);
+                    cparams.moe_profile, cparams.moe_cache_static, cparams.moe_cache_pin_mib);
         }
 
         if (!cparams.moe_profile_output.empty()) {
@@ -3934,6 +3935,7 @@ llama_context_params llama_context_default_params() {
         /*.moe_profile_output          =*/ nullptr,
         /*.moe_profile                 =*/ nullptr,
         /*.moe_cache_static            =*/ false,
+        /*.moe_cache_pin_mib           =*/ 0,
         /*.moe_stats                   =*/ nullptr,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,

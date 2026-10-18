@@ -2,6 +2,7 @@
 
 #include "llama-impl.h"
 #include "llama-model.h"
+#include "llama-mmap.h"
 
 #include "ggml-cpp.h"
 
@@ -319,6 +320,9 @@ struct llama_moe_cache::impl {
 
     bool static_mode;
 
+    // bytes of the hottest non-resident experts locked in RAM, 0 = populate only, never lock
+    int64_t pin_bytes;
+
     int32_t n_expert_used;
 
     stats stats_small; // up to 8 tokens per ubatch
@@ -344,9 +348,136 @@ struct llama_moe_cache::impl {
     // views used by copy_experts
     ggml_context_ptr ctx_views;
 
+    // the experts of the cached layers that the profile did not seed resident are the complement: their pages are
+    // faulted into RAM so a decode miss never reads the GGUF from disk, the hottest are locked so they can never
+    // be evicted, and the pages of the resident ones are dropped from the page cache after their upload to the banks
+    void cache_complement(const llama_model & model, const std::vector<std::vector<int32_t>> & ranked) {
+        if (!llama_mmap::POPULATE_SUPPORTED && !llama_mmap::PIN_SUPPORTED) {
+            LLAMA_LOG_WARN("%s: keeping the MoE complement in RAM is not supported on this platform\n", __func__);
+            return;
+        }
+
+        const int32_t n_expert = (int32_t) model.hparams.n_expert;
+
+        struct expert_range {
+            llama_mmap * mm;
+            size_t  first;
+            size_t  last;
+            bool    resident;
+        };
+
+        std::vector<expert_range> ranges;
+        std::vector<std::vector<int32_t>> idx(model.layers.size()*n_expert); // il*n_expert + e -> ranges of all expert tensors
+
+        for (size_t il = 0; il < model.layers.size(); ++il) {
+            if (layers[il].ig < 0) {
+                continue;
+            }
+            for (const ggml_tensor * w : layers[il].experts) {
+                size_t first, last;
+                llama_mmap * mm = model.mmap_range(w, first, last);
+                if (mm == nullptr) {
+                    LLAMA_LOG_WARN("%s: the experts of layer %zu are not mmap'ed, the MoE complement is not kept in RAM\n", __func__, il);
+                    return;
+                }
+                const size_t expert_size = w->nb[2];
+                for (int32_t e = 0; e < n_expert; ++e) {
+                    idx[il*n_expert + e].push_back((int32_t) ranges.size());
+                    ranges.push_back({ mm, first + e*expert_size, first + (e + 1)*expert_size, false });
+                }
+            }
+        }
+
+        // a seeded expert is in the bank, its pages are no longer read during decode
+        for (const group & g : groups) {
+            for (int32_t s = 0; s < g.n_slots; ++s) {
+                const int32_t key = g.lru.key_of[s];
+                if (key < 0) {
+                    continue;
+                }
+                for (const int32_t ir : idx[key]) {
+                    ranges[ir].resident = true;
+                }
+            }
+        }
+
+        // merge the contiguous ranges of a mapping so one system call covers as many experts as possible
+        auto merge = [&](const std::vector<expert_range> & v) {
+            std::vector<std::pair<llama_mmap *, std::pair<size_t, size_t>>> res;
+            for (const expert_range & r : v) {
+                if (!res.empty() && res.back().first == r.mm && res.back().second.second == r.first) {
+                    res.back().second.second = r.last;
+                } else {
+                    res.emplace_back(r.mm, std::make_pair(r.first, r.last));
+                }
+            }
+            return res;
+        };
+
+        auto by_file_pos = [](const expert_range & a, const expert_range & b) {
+            return a.mm != b.mm ? a.mm < b.mm : a.first < b.first;
+        };
+
+        std::vector<expert_range> cold; // resident experts, their pages can be dropped
+        std::vector<expert_range> warm; // the complement, it must stay readable from RAM
+        for (const expert_range & r : ranges) {
+            (r.resident ? cold : warm).push_back(r);
+        }
+        std::sort(cold.begin(), cold.end(), by_file_pos);
+        std::sort(warm.begin(), warm.end(), by_file_pos);
+
+        const double mib = 1024.0*1024.0;
+
+        size_t cold_bytes = 0;
+        for (const auto & m : merge(cold)) {
+            m.first->release(m.second.first, m.second.second);
+            cold_bytes += m.second.second - m.second.first;
+        }
+
+        size_t warm_bytes = 0;
+        for (const auto & m : merge(warm)) {
+            m.first->populate(m.second.first, m.second.second);
+            warm_bytes += m.second.second - m.second.first;
+        }
+
+        // lock the hottest experts of the complement, stop at the limit of the process
+        size_t  pinned = 0;
+        size_t  n_pinned = 0;
+        bool    stop = false;
+        for (size_t il = 0; il < model.layers.size() && !stop; ++il) {
+            if (layers[il].ig < 0) {
+                continue;
+            }
+            for (const int32_t e : ranked[il]) {
+                for (const int32_t ir : idx[il*n_expert + e]) {
+                    const expert_range & r = ranges[ir];
+                    if (r.resident) {
+                        continue;
+                    }
+                    if ((int64_t) pinned + (int64_t) (r.last - r.first) > pin_bytes) {
+                        stop = true;
+                        break;
+                    }
+                    if (!r.mm->pin(r.first, r.last)) {
+                        stop = true;
+                        break;
+                    }
+                    pinned   += r.last - r.first;
+                    n_pinned++;
+                }
+                if (stop) {
+                    break;
+                }
+            }
+        }
+
+        LLAMA_LOG_INFO("%s: MoE complement: %.2f MiB faulted into RAM, %.2f MiB pinned in %zu experts, %.2f MiB of resident pages dropped\n",
+                __func__, warm_bytes/mib, pinned/mib, n_pinned, cold_bytes/mib);
+    }
+
     impl(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size,
-            const std::string & profile_path, bool static_mode_in) :
-            static_mode(static_mode_in), n_expert_used(model.hparams.n_expert_used_max()), layers(model.layers.size()),
+            const std::string & profile_path, bool static_mode_in, int64_t pin_mib) :
+            static_mode(static_mode_in), pin_bytes((int64_t) pin_mib*1024*1024), n_expert_used(model.hparams.n_expert_used_max()), layers(model.layers.size()),
             use(model.layers.size()*model.hparams.n_expert, 0) {
         for (size_t i = 0; i < backends.size(); ++i) {
             const auto dev_type = ggml_backend_dev_type(ggml_backend_get_device(backends[i]));
@@ -625,6 +756,10 @@ struct llama_moe_cache::impl {
                 LLAMA_LOG_INFO("%s: static MoE cache: %d resident experts, %d scratch slots, quota %d per layer, up to %d tokens per batch\n",
                     __func__, g.lru.n_resident, n_scratch, q, (int) g.max_batch_cached);
             }
+
+            if (static_mode) {
+                cache_complement(model, ranked);
+            }
         }
 
         // as weights, the ops that read the banks run on the device and the slot maps are copied with the copy callback
@@ -888,8 +1023,8 @@ struct llama_moe_cache::impl {
 };
 
 llama_moe_cache::llama_moe_cache(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size,
-        const std::string & profile_path, bool static_mode) :
-    pimpl(new impl(model, backends, bufts, size, profile_path, static_mode)) {
+        const std::string & profile_path, bool static_mode, int64_t pin_mib) :
+    pimpl(new impl(model, backends, bufts, size, profile_path, static_mode, pin_mib)) {
 }
 
 llama_moe_cache::~llama_moe_cache() = default;
