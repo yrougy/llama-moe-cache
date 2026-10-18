@@ -2796,6 +2796,32 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_PROFILE_OUTPUT"));
     add_opt(common_arg(
+        {"--moe-profile"}, "FILE",
+        "seed the MoE cache from the per-(layer,expert) routing counts of a CSV written by --moe-profile-output, "
+        "the hottest experts of each layer get a resident slot (default: disabled)\n"
+        "(example: --moe-profile moe_profile.csv --moe-cache-static)",
+        [](common_params & params, const std::string & value) {
+            params.moe_profile = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_PROFILE"));
+    add_opt(common_arg(
+        {"--moe-cache-static"},
+        "never evict the experts seeded by --moe-profile, the experts that are not resident use the rotating scratch slots "
+        "(default: false, requires --moe-profile)\n",
+        [](common_params & params) {
+            params.moe_cache_static = true;
+        }
+    ).set_env("LLAMA_ARG_MOE_CACHE_STATIC"));
+    add_opt(common_arg(
+        {"--moe-stats"}, "FILE",
+        "write the per-(layer,expert) MoE selection counts and cache residency to this CSV file when the context is destroyed, "
+        "requires --moe-cache-mib (default: disabled)\n"
+        "(example: --moe-stats moe_stats.csv)",
+        [](common_params & params, const std::string & value) {
+            params.moe_stats = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_STATS"));
+    add_opt(common_arg(
         {"-ncffn", "--n-cpu-ffn"}, "N",
         "keep the dense FFN weights of the first N layers in the CPU\n"
         "(dense models; for MoE expert weights use --n-cpu-moe)",

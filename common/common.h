@@ -597,6 +597,12 @@ struct common_params {
 
     std::string moe_profile_output; // write the per-(layer,expert) routing counts to this CSV file, empty = disabled
 
+    std::string moe_profile; // CSV of the routing counts used to seed the MoE cache, empty = disabled
+
+    bool moe_cache_static = false; // keep the experts seeded from moe_profile resident, the misses use the scratch slots
+
+    std::string moe_stats; // write the per-(layer,expert) selection counts and residency of the MoE cache to this CSV file, empty = disabled
+
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 
     // multimodal models (see tools/mtmd)

@@ -4,6 +4,7 @@
 
 #include <map>
 #include <memory>
+#include <string>
 #include <vector>
 
 struct llama_model;
@@ -13,7 +14,9 @@ struct llama_model;
 class llama_moe_cache {
 public:
     // backends are all the backends of the context, each GPU gets its own cache of the given size for the layers assigned to it
-    llama_moe_cache(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size);
+    // profile_path seeds the cache from the routing counts of a --moe-profile-output CSV, static_mode then keeps those experts resident
+    llama_moe_cache(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size,
+                     const std::string & profile_path, bool static_mode);
     ~llama_moe_cache();
 
     // the device that caches layer il
@@ -33,6 +36,9 @@ public:
     int64_t copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last);
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
+
+    // write the per (layer, expert) selection counts and residency to a CSV file
+    void export_stats(const std::string & path) const;
 
 private:
     struct impl;

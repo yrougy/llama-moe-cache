@@ -6,13 +6,18 @@
 #include "ggml-cpp.h"
 
 #include <algorithm>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
 #include <stdexcept>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
 namespace {
 
 // LRU of the experts of a group of layers, the slot of each expert is kept in the slot map of its layer
+// in static mode every layer owns a disjoint slot range, so no layer can evict a slot another layer is reading
 struct moe_cache_lru {
     int32_t n_expert = 0;
     int32_t n_slots  = 0;
@@ -20,15 +25,23 @@ struct moe_cache_lru {
     std::vector<int32_t *> slot_map; // [n_layer] data of the slot maps, -1 if the expert is not cached
     std::vector<int32_t>   key_of;   // [n_slots] il*n_expert + expert, -1 if empty
 
-    // doubly linked list of the slots, head is the least recently used
+    // doubly linked list of the slots of each chain, head is the least recently used
     std::vector<int32_t> prev;
     std::vector<int32_t> next;
-    int32_t head = -1;
-    int32_t tail = -1;
+    std::vector<int32_t> lo;    // [n_layer] first scratch slot of the layer
+    std::vector<int32_t> hi;    // [n_layer] one past the last scratch slot of the layer
+    std::vector<int32_t> chain; // [n_layer] chain used by the layer
+    std::vector<int32_t> head;  // [n_chain]
+    std::vector<int32_t> tail;  // [n_chain]
 
     std::vector<uint32_t> seen; // [n_expert]
     uint32_t seen_gen = 0;
     std::vector<int32_t> uniq;
+
+    // static mode: the first slots of each layer range hold the experts seeded from the routing profile and are
+    // never evicted, the rest of the range is an LRU serving the experts the profile did not rank resident
+    bool     static_mode = false;
+    int32_t  n_resident  = 0;
 
     void init(int32_t n_layer, int32_t n_expert, int32_t n_slots) {
         this->n_expert = n_expert;
@@ -41,27 +54,43 @@ struct moe_cache_lru {
             prev[s] = s - 1;
             next[s] = s + 1 < n_slots ? s + 1 : -1;
         }
-        head = 0;
-        tail = n_slots - 1;
+        lo.assign(n_layer, 0);
+        hi.assign(n_layer, n_slots);
+        chain.assign(n_layer, 0);
+        head.assign(n_layer, 0);
+        tail.assign(n_layer, n_slots - 1);
         seen.assign(n_expert, 0);
     }
 
-    // move slot s to the tail (most recently used)
-    void touch(int32_t s) {
-        if (s == tail) {
-            return;
+    // give a slot to each expert of layer il in the order of ranked, at most q of them
+    // consecutive experts get consecutive slots, so the uploads of a hit batch merge
+    void seed(int32_t il, const std::vector<int32_t> & ranked, int32_t q) {
+        int32_t * slots = slot_map[il];
+        for (int32_t i = 0; i < (int32_t) ranked.size() && i < q; ++i) {
+            const int32_t e = ranked[i];
+            GGML_ASSERT(e >= 0 && e < n_expert && slots[e] < 0);
+            const int32_t s = lo[il]++;
+            GGML_ASSERT(s < hi[il]);
+            key_of[s] = il*n_expert + e;
+            slots[e] = s;
+            n_resident++;
         }
-        if (prev[s] >= 0) {
-            next[prev[s]] = next[s];
-        } else {
-            head = next[s];
-        }
-        prev[next[s]] = prev[s];
+    }
 
-        prev[s] = tail;
-        next[s] = -1;
-        next[tail] = s;
-        tail = s;
+    // the LRU chain of each layer covers only its scratch slots [lo[il], hi[il]), the seeded slots are outside
+    void init_chains(const std::vector<int32_t> & layers) {
+        for (int32_t il : layers) {
+            const int32_t c = chain[il];
+            for (int32_t s = lo[il]; s < hi[il]; ++s) {
+                prev[s] = s - 1;
+                next[s] = s + 1 < hi[il] ? s + 1 : -1;
+            }
+            head[c] = lo[il] < hi[il] ? lo[il] : -1;
+            tail[c] = hi[il] - 1;
+            if (head[c] >= 0) {
+                prev[head[c]] = -1;
+            }
+        }
     }
 
     struct fill {
@@ -69,11 +98,34 @@ struct moe_cache_lru {
         int32_t slot;
     };
 
-    // give a slot to each expert selected by ids in layer il, the misses evict the least recently used experts
+    // move slot s to the tail (most recently used) of the chain of layer il
+    void touch(int32_t s, int32_t il) {
+        const int32_t c = chain[il];
+        if (s == tail[c]) {
+            return;
+        }
+        if (prev[s] >= 0) {
+            next[prev[s]] = next[s];
+        } else {
+            head[c] = next[s];
+        }
+        prev[next[s]] = prev[s];
+
+        prev[s] = tail[c];
+        next[s] = -1;
+        next[tail[c]] = s;
+        tail[c] = s;
+    }
+
+    // give a slot to each expert selected by ids in layer il, the misses evict the least recently used scratch slot
+    // in static mode the seeded experts are never evicted, the misses take the rotating scratch slots
     // returns false if the ids select more distinct experts than there are slots
-    bool plan(int32_t il, const int32_t * ids, size_t n_ids, std::vector<fill> & fills, size_t & n_hit) {
+    bool plan(int32_t il, const int32_t * ids, size_t n_ids, std::vector<fill> & fills, size_t & n_hit, size_t & n_scratch) {
         fills.clear();
         n_hit = 0;
+        n_scratch = 0;
+
+        const int32_t c = chain[il];
 
         if (++seen_gen == 0) {
             std::fill(seen.begin(), seen.end(), 0);
@@ -87,7 +139,7 @@ struct moe_cache_lru {
                 uniq.push_back(ids[i]);
             }
         }
-        if (uniq.size() > (size_t) n_slots) {
+        if (uniq.size() > (size_t) (hi[il] - lo[il])) {
             return false;
         }
 
@@ -96,7 +148,9 @@ struct moe_cache_lru {
         // hits go to the tail first, so the head can be evicted below
         for (int32_t e : uniq) {
             if (slots[e] >= 0) {
-                touch(slots[e]);
+                if (slots[e] >= lo[il]) {
+                    touch(slots[e], il);
+                }
                 n_hit++;
             }
         }
@@ -106,13 +160,19 @@ struct moe_cache_lru {
             if (slots[e] >= 0) {
                 continue;
             }
-            const int32_t s = head;
+            const int32_t s = head[c];
+            if (s < 0) {
+                return false;
+            }
             if (key_of[s] >= 0) {
                 slot_map[key_of[s] / n_expert][key_of[s] % n_expert] = -1;
             }
             key_of[s] = il*n_expert + e;
             slots[e] = s;
-            touch(s);
+            touch(s, il);
+            if (static_mode) {
+                n_scratch++;
+            }
             fills.push_back({ e, s });
         }
         return true;
@@ -148,6 +208,63 @@ static bool llama_moe_cache_is_host_weight(const ggml_tensor * t) {
         ggml_backend_buffer_is_host(t->buffer);
 }
 
+// the per-(layer,expert) routing counts written by --moe-profile-output
+// ranked[il] holds the experts of layer il in the order of descending use, ties by ascending index
+static bool llama_moe_cache_load_profile(const char * path, int32_t n_layer, int32_t n_expert,
+        std::vector<std::vector<int32_t>> & ranked) {
+    FILE * f = std::fopen(path, "r");
+    if (f == nullptr) {
+        LLAMA_LOG_WARN("%s: failed to open %s\n", __func__, path);
+        return false;
+    }
+
+    char line[256];
+    if (std::fgets(line, sizeof(line), f) == nullptr || std::strcmp(line, "layer,expert,count,weight_sum\n") != 0) {
+        LLAMA_LOG_WARN("%s: %s has no routing counts\n", __func__, path);
+        std::fclose(f);
+        return false;
+    }
+
+    std::vector<std::vector<std::pair<uint64_t, int32_t>>> heat(n_layer);
+    int n_rows = 0;
+    while (std::fgets(line, sizeof(line), f) != nullptr) {
+        int il, e;
+        unsigned long long c;
+        double w;
+        if (std::sscanf(line, "%d,%d,%llu,%lf", &il, &e, &c, &w) != 4) {
+            continue;
+        }
+        if (il < 0 || il >= n_layer || e < 0 || e >= n_expert) {
+            continue;
+        }
+        heat[il].push_back({ c, e });
+        n_rows++;
+    }
+    std::fclose(f);
+
+    if (n_rows == 0) {
+        LLAMA_LOG_WARN("%s: %s is empty\n", __func__, path);
+        return false;
+    }
+
+    ranked.assign(n_layer, {});
+    for (int32_t il = 0; il < n_layer; ++il) {
+        std::sort(heat[il].begin(), heat[il].end(), [](const auto & a, const auto & b) {
+            if (a.first != b.first) {
+                return a.first > b.first;
+            }
+            return a.second < b.second;
+        });
+        for (const auto & h : heat[il]) {
+            ranked[il].push_back(h.second);
+        }
+    }
+
+    LLAMA_LOG_INFO("%s: %s: %d (layer,expert) pairs, %d layers with routing data\n",
+        __func__, path, n_rows, (int) std::count_if(heat.begin(), heat.end(), [](const auto & v) { return !v.empty(); }));
+    return true;
+}
+
 }
 
 struct llama_moe_cache::impl {
@@ -172,6 +289,7 @@ struct llama_moe_cache::impl {
         std::vector<ggml_tensor *> banks; // device storage of all slots, one per expert tensor
         size_t host_bytes = 0;
         int32_t n_slots = 0;
+        int64_t max_batch_cached = max_batch; // tokens a batch can have before the group stops caching
         moe_cache_lru lru;
     };
 
@@ -188,12 +306,18 @@ struct llama_moe_cache::impl {
     };
 
     struct stats {
-        size_t hits   = 0;
-        size_t misses = 0;
-        size_t bytes  = 0;
+        size_t hits    = 0;
+        size_t misses  = 0;
+        size_t bytes   = 0;
+        size_t scratch = 0; // misses that took a scratch slot, the experts the profile did not seed resident
     };
 
     static constexpr int64_t max_batch = 32;
+
+    // in static mode each layer's scratch pool serves this many tokens, batches above it are not cached
+    static constexpr int64_t max_batch_scratch = 1;
+
+    bool static_mode;
 
     int32_t n_expert_used;
 
@@ -210,6 +334,8 @@ struct llama_moe_cache::impl {
     std::vector<int32_t> ids;
     std::vector<moe_cache_lru::fill> fills;
 
+    std::vector<uint64_t> use; // [n_layer*n_expert] selections seen by the copy callback, the runtime routing counts
+
     // slot maps in host memory
     ggml_context_ptr ctx_host;
     ggml_backend_buffer_ptr buf_host;
@@ -218,8 +344,10 @@ struct llama_moe_cache::impl {
     // views used by copy_experts
     ggml_context_ptr ctx_views;
 
-    impl(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size) :
-            n_expert_used(model.hparams.n_expert_used_max()), layers(model.layers.size()) {
+    impl(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size,
+            const std::string & profile_path, bool static_mode_in) :
+            static_mode(static_mode_in), n_expert_used(model.hparams.n_expert_used_max()), layers(model.layers.size()),
+            use(model.layers.size()*model.hparams.n_expert, 0) {
         for (size_t i = 0; i < backends.size(); ++i) {
             const auto dev_type = ggml_backend_dev_type(ggml_backend_get_device(backends[i]));
             if (dev_type == GGML_BACKEND_DEVICE_TYPE_GPU || dev_type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
@@ -427,6 +555,78 @@ struct llama_moe_cache::impl {
             }
         }
 
+        if (static_mode && !model.hparams.no_alloc) {
+            std::vector<std::vector<int32_t>> ranked;
+            if (profile_path.empty() ||
+                    !llama_moe_cache_load_profile(profile_path.c_str(), model.layers.size(), model.hparams.n_expert, ranked)) {
+                LLAMA_LOG_WARN("%s: a static MoE cache needs a routing profile, using LRU instead\n", __func__);
+                static_mode = false;
+            }
+            for (size_t ig = 0; static_mode && ig < groups.size(); ++ig) {
+                group & g = groups[ig];
+                if (g.n_slots == 0) {
+                    continue;
+                }
+                const int32_t n_layers = (int32_t) g.layers.size();
+
+                // every layer owns a disjoint range of slots, so no layer can evict a slot another layer is reading:
+                // the first slots of the range hold the experts seeded from the profile, the rest is that layer's LRU
+                const int32_t n_scratch = std::min(g.n_slots / 2, (int32_t)(n_expert_used * n_layers * max_batch_scratch));
+                if (n_scratch < n_expert_used * n_layers) {
+                    LLAMA_LOG_WARN("%s: MoE cache is too small to be static, using LRU instead\n", __func__);
+                    static_mode = false;
+                    break;
+                }
+                g.lru.static_mode = true;
+                g.lru.n_resident  = 0;
+
+                const int32_t budget   = g.n_slots - n_scratch;
+                const int32_t q        = budget / n_layers;
+                int32_t       extra    = q > 0 ? budget % n_layers : 0;
+                int32_t       sc       = n_scratch / n_layers;
+                int32_t       sc_extra = n_scratch % n_layers;
+                int32_t       base     = 0;
+                int64_t       mb       = max_batch;
+                for (int32_t il : g.layers) {
+                    const int32_t qi  = q + (extra > 0 ? 1 : 0);
+                    const int32_t sci = sc + (sc_extra > 0 ? 1 : 0);
+                    extra    -= (extra > 0 ? 1 : 0);
+                    sc_extra -= (sc_extra > 0 ? 1 : 0);
+                    g.lru.chain[il] = il;
+                    g.lru.lo[il]    = base;
+                    g.lru.hi[il]    = base + qi + sci;
+                    base += qi + sci;
+                    g.lru.seed(il, ranked[il], qi);
+                    mb = std::min(mb, (int64_t) sci / n_expert_used);
+                }
+                g.max_batch_cached = mb;
+
+                g.lru.init_chains(g.layers);
+
+                // the seeded slots are resident from the first ubatch, so their bytes must be in the bank now
+                size_t seeded_bytes = 0;
+                for (int32_t s = 0; s < g.n_slots; ++s) {
+                    const int32_t key = g.lru.key_of[s];
+                    if (key < 0) {
+                        continue;
+                    }
+                    const int32_t il  = key / g.lru.n_expert;
+                    const int32_t e   = key % g.lru.n_expert;
+                    for (size_t ip = 0; ip < layers[il].experts.size(); ++ip) {
+                        const ggml_tensor * w    = layers[il].experts[ip];
+                        ggml_tensor       * bank = g.banks[ip];
+                        const size_t expert_size = w->nb[2];
+                        ggml_backend_tensor_set(bank, (const uint8_t *) w->data + e*expert_size, s*expert_size, expert_size);
+                        seeded_bytes += expert_size;
+                    }
+                }
+                LLAMA_LOG_INFO("%s: uploaded %.2f MiB of seeded experts\n", __func__, seeded_bytes/1024.0/1024.0);
+
+                LLAMA_LOG_INFO("%s: static MoE cache: %d resident experts, %d scratch slots, quota %d per layer, up to %d tokens per batch\n",
+                    __func__, g.lru.n_resident, n_scratch, q, (int) g.max_batch_cached);
+            }
+        }
+
         // as weights, the ops that read the banks run on the device and the slot maps are copied with the copy callback
         for (device & d : devices) {
             if (d.buf) {
@@ -464,9 +664,10 @@ struct llama_moe_cache::impl {
             return nullptr;
         }
         const layer & l = layers[il];
+        const group & g = groups[l.ig];
 
         // large batches use most experts of a layer, so they gain little from the cache and would evict the experts used in generation
-        if (n_tokens == 0 || n_tokens > max_batch || std::min(n_tokens*n_expert_used, l.slot_map->ne[1]) > groups[l.ig].n_slots) {
+        if (n_tokens == 0 || n_tokens > g.max_batch_cached || n_tokens*n_expert_used > g.lru.hi[il] - g.lru.lo[il]) {
             return nullptr;
         }
         return l.slot_map;
@@ -550,8 +751,13 @@ struct llama_moe_cache::impl {
         ggml_backend_synchronize(backend);
 
         size_t n_hit = 0;
-        if (!g.lru.plan(il, ids.data(), ids.size(), fills, n_hit)) {
+        size_t n_scratch = 0;
+        if (!g.lru.plan(il, ids.data(), ids.size(), fills, n_hit, n_scratch)) {
             GGML_ABORT("the MoE cache is too small for the experts selected in layer %d", il);
+        }
+
+        for (size_t i = 0; i < ids.size(); ++i) {
+            use[(size_t) il*g.lru.n_expert + ids[i]]++;
         }
 
         // upload the missing experts, consecutive experts going to consecutive slots are uploaded together
@@ -575,6 +781,7 @@ struct llama_moe_cache::impl {
         st.hits   += n_hit;
         st.misses += fills.size();
         st.bytes  += bytes;
+        st.scratch += n_scratch;
 
         // the next copy synchronizes the backend before it changes the slot map again
         ggml_backend_tensor_set_async(backend, dst, src->data, 0, ggml_nbytes(src));
@@ -588,19 +795,101 @@ struct llama_moe_cache::impl {
             if (n == 0) {
                 return;
             }
-            LLAMA_LOG_INFO("llama_moe_cache: %s: hits = %zu, misses = %zu, hit rate = %.2f%%, uploaded = %.2f MiB\n",
-                name, st.hits, st.misses, 100.0*st.hits/n, st.bytes/1024.0/1024.0);
+            LLAMA_LOG_INFO("llama_moe_cache: %s: hits = %zu, misses = %zu, hit rate = %.2f%%, uploaded = %.2f MiB, scratch = %zu\n",
+                name, st.hits, st.misses, 100.0*st.hits/n, st.bytes/1024.0/1024.0, st.scratch);
         };
         log("ubatch <= 8", stats_small);
         log("ubatch  > 8", stats_large);
         if (stats_copy.hits > 0) {
             LLAMA_LOG_INFO("llama_moe_cache: large batches: %zu experts copied from the cache, %.2f MiB\n", stats_copy.hits, stats_copy.bytes/1024.0/1024.0);
         }
+
+        // how much of the model is resident, and how many expert computations the cache served
+        int32_t n_expert = 0;
+        for (const layer & l : layers) {
+            if (l.slot_map != nullptr) {
+                n_expert = l.slot_map->ne[1];
+                break;
+            }
+        }
+        if (n_expert == 0) {
+            return;
+        }
+
+        size_t n_cached_layers = 0;
+        size_t n_resident      = 0;
+        size_t resident_bytes  = 0;
+        size_t gpu_experts     = 0;
+        for (size_t il = 0; il < layers.size(); ++il) {
+            if (layers[il].ig < 0) {
+                continue;
+            }
+            n_cached_layers++;
+            const group & g = groups[layers[il].ig];
+            const int32_t * slots = g.lru.slot_map[il];
+            if (slots == nullptr) {
+                continue;
+            }
+            for (int32_t e = 0; e < n_expert; ++e) {
+                if (slots[e] >= 0) {
+                    n_resident++;
+                    for (const ggml_tensor * ref : g.ref) {
+                        resident_bytes += ref->nb[2];
+                    }
+                }
+                gpu_experts += use[il*n_expert + e];
+            }
+        }
+
+        const size_t tokens = gpu_experts / n_expert_used;
+        LLAMA_LOG_INFO("llama_moe_cache: %zu/%zu layers cached, %zu/%zu experts resident (%.2f MiB), %zu tokens served by the GPU cache, %zu expert computations left to the CPU\n",
+            n_cached_layers, layers.size(), n_resident, layers.size()*n_expert, resident_bytes/1024.0/1024.0,
+            tokens, (layers.size() - n_cached_layers)*tokens*n_expert_used);
+    }
+
+    void export_stats(const char * path) const {
+        int32_t n_expert = 0;
+        for (const layer & l : layers) {
+            if (l.slot_map != nullptr) {
+                n_expert = l.slot_map->ne[1];
+                break;
+            }
+        }
+        if (n_expert == 0) {
+            return;
+        }
+
+        const std::string tmp = std::string(path) + ".tmp";
+        FILE * f = std::fopen(tmp.c_str(), "w");
+        if (f == nullptr) {
+            LLAMA_LOG_WARN("%s: failed to open %s\n", __func__, tmp.c_str());
+            return;
+        }
+
+        fprintf(f, "layer,expert,use,resident\n");
+        for (size_t il = 0; il < layers.size(); ++il) {
+            const int32_t ig = layers[il].ig;
+            const int32_t * slots = ig < 0 ? nullptr : groups[ig].lru.slot_map[il];
+            for (int32_t e = 0; e < n_expert; ++e) {
+                fprintf(f, "%zu,%d,%zu,%d\n", il, e, use[il*n_expert + e], slots != nullptr && slots[e] >= 0 ? 1 : 0);
+            }
+        }
+
+        if (std::fclose(f) != 0) {
+            LLAMA_LOG_WARN("%s: failed to close %s\n", __func__, tmp.c_str());
+            return;
+        }
+        if (std::rename(tmp.c_str(), path) != 0) {
+            LLAMA_LOG_WARN("%s: failed to rename %s to %s\n", __func__, tmp.c_str(), path);
+            return;
+        }
+        LLAMA_LOG_INFO("%s: wrote %s\n", __func__, path);
     }
 };
 
-llama_moe_cache::llama_moe_cache(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size) :
-    pimpl(new impl(model, backends, bufts, size)) {
+llama_moe_cache::llama_moe_cache(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size,
+        const std::string & profile_path, bool static_mode) :
+    pimpl(new impl(model, backends, bufts, size, profile_path, static_mode)) {
 }
 
 llama_moe_cache::~llama_moe_cache() = default;
@@ -636,4 +925,8 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_moe_cache::memory_breakdown()
         res[ggml_backend_buffer_get_type(pimpl->buf_host.get())] += pimpl->buf_host_size;
     }
     return res;
+}
+
+void llama_moe_cache::export_stats(const std::string & path) const {
+    pimpl->export_stats(path.c_str());
 }

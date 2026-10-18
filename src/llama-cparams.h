@@ -60,6 +60,12 @@ struct llama_cparams {
 
     std::string moe_profile_output; // write the per-(layer,expert) routing counts to this file, empty = disabled
 
+    std::string moe_profile;        // seed the MoE cache from these routing counts, empty = disabled
+
+    bool moe_cache_static;          // keep the seeded experts resident, the misses use the scratch slots
+
+    std::string moe_stats;          // write the per-(layer,expert) selection counts and residency of the cache to this file, empty = disabled
+
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
 
     enum llama_context_type ctx_type;

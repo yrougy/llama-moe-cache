@@ -400,6 +400,12 @@ extern "C" {
 
         const char * moe_profile_output; // write the per-(layer,expert) routing counts to this CSV file at context destruction, NULL = disabled [EXPERIMENTAL]
 
+        const char * moe_profile; // CSV of the routing counts used to seed the MoE cache, NULL = disabled [EXPERIMENTAL]
+
+        bool moe_cache_static; // keep the experts seeded from moe_profile resident, the misses go to the scratch slots [EXPERIMENTAL]
+
+        const char * moe_stats; // write the per-(layer,expert) selection counts and residency of the MoE cache to this CSV file at context destruction, NULL = disabled [EXPERIMENTAL]
+
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted
         // currently works only with CPU execution
