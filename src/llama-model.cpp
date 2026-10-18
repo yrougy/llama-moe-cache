@@ -2392,6 +2392,14 @@ llama_mmap * llama_model::mmap_range(const ggml_tensor * t, size_t & first, size
     return nullptr;
 }
 
+size_t llama_model::n_mappings() const {
+    return pimpl->mappings.size();
+}
+
+llama_mmap * llama_model::mapping(size_t i) const {
+    return i < pimpl->mappings.size() ? pimpl->mappings[i].get() : nullptr;
+}
+
 const ggml_tensor * llama_model::get_tensor(const char * name) const {
     auto it = std::find_if(tensors_by_name.begin(), tensors_by_name.end(),
             [name](const std::pair<std::string, ggml_tensor *> & it) {

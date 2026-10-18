@@ -440,6 +440,37 @@ struct llama_moe_cache::impl {
             warm_bytes += m.second.second - m.second.first;
         }
 
+        // the bytes of the GGUF that are not expert tensors of the cached layers are read on a cold cache during decode,
+        // fault them in now so the decode hot path never goes to the disk for them
+        size_t rest_bytes = 0;
+        {
+            std::vector<expert_range> all = ranges;
+            std::sort(all.begin(), all.end(), by_file_pos);
+
+            llama_mmap * mm  = nullptr;
+            size_t           pos = 0;
+            auto flush = [&](size_t first, size_t last) {
+                if (first < last) {
+                    mm->populate(first, last);
+                    rest_bytes += last - first;
+                }
+            };
+            for (const expert_range & r : all) {
+                if (r.mm != mm) {
+                    if (mm != nullptr) {
+                        flush(pos, mm->size());
+                    }
+                    mm  = r.mm;
+                    pos = 0;
+                }
+                flush(pos, r.first);
+                pos = std::max(pos, r.last);
+            }
+            if (mm != nullptr) {
+                flush(pos, mm->size());
+            }
+        }
+
         // lock the hottest experts of the complement, stop at the limit of the process
         size_t  pinned = 0;
         size_t  n_pinned = 0;
@@ -471,8 +502,8 @@ struct llama_moe_cache::impl {
             }
         }
 
-        LLAMA_LOG_INFO("%s: MoE complement: %.2f MiB faulted into RAM, %.2f MiB pinned in %zu experts, %.2f MiB of resident pages dropped\n",
-                __func__, warm_bytes/mib, pinned/mib, n_pinned, cold_bytes/mib);
+        LLAMA_LOG_INFO("%s: MoE complement: %.2f MiB faulted into RAM, %.2f MiB of the rest faulted into RAM, %.2f MiB pinned in %zu experts, %.2f MiB of resident pages dropped\n",
+                __func__, warm_bytes/mib, rest_bytes/mib, pinned/mib, n_pinned, cold_bytes/mib);
     }
 
     impl(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size,

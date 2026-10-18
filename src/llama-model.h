@@ -790,6 +790,10 @@ struct llama_model {
     // the mmap'ed GGUF holding the data of a tensor, plus the file range [first, last) of that tensor, nullptr if the tensor is not mmap'ed
     llama_mmap * mmap_range(const struct ggml_tensor * t, size_t & first, size_t & last) const;
 
+    // the mmap'ed GGUF files of the model, empty if the model is not mmap'ed
+    size_t n_mappings() const;
+    llama_mmap * mapping(size_t i) const;
+
     const struct ggml_tensor * get_tensor(const char * name) const;
 
     float get_rope_freq_base (const llama_cparams & cparams, int il) const;
