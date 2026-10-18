@@ -2822,6 +2822,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_CACHE_PIN_MIB"));
     add_opt(common_arg(
+        {"--moe-cache-cpu-fallback"},
+        "compute the MoE experts that are not resident in the cache on the CPU, the GPU reads an all-zero slot for them, "
+        "so nothing is uploaded to the GPU during generation (default: false, requires --moe-profile and --moe-cache-static)\n",
+        [](common_params & params) {
+            params.moe_cache_cpu_fallback = true;
+        }
+    ).set_env("LLAMA_ARG_MOE_CACHE_CPU_FALLBACK"));
+    add_opt(common_arg(
         {"--moe-stats"}, "FILE",
         "write the per-(layer,expert) MoE selection counts and cache residency to this CSV file when the context is destroyed, "
         "requires --moe-cache-mib (default: disabled)\n"

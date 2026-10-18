@@ -1750,6 +1750,8 @@ struct llama_context_params common_context_params_to_llama(const common_params &
 
     cparams.moe_cache_pin_mib = params.moe_cache_pin_mib;
 
+    cparams.moe_cache_cpu_fallback = params.moe_cache_cpu_fallback;
+
     cparams.moe_stats = params.moe_stats.empty() ? nullptr : params.moe_stats.c_str();
 
     return cparams;

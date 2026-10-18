@@ -16,8 +16,9 @@ public:
     // backends are all the backends of the context, each GPU gets its own cache of the given size for the layers assigned to it
     // profile_path seeds the cache from the routing counts of a --moe-profile-output CSV, static_mode then keeps those experts resident
     // pin_mib locks the hottest experts that are not resident in RAM, 0 = only fault them in without locking
+    // cpu_fallback computes the experts that are not resident on the CPU, the GPU reads a zero slot for them, so nothing is uploaded
     llama_moe_cache(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size,
-                     const std::string & profile_path, bool static_mode, int64_t pin_mib);
+                     const std::string & profile_path, bool static_mode, int64_t pin_mib, bool cpu_fallback);
     ~llama_moe_cache();
 
     // the device that caches layer il
@@ -25,6 +26,9 @@ public:
 
     // the slot map of layer il, if its experts can be read from the cache for n_tokens tokens, nullptr otherwise
     ggml_tensor * get_slot_map(int32_t il, int64_t n_tokens, int64_t n_expert_used) const;
+
+    // the map of the experts of layer il that the CPU computes, nullptr if the cache has no CPU fallback
+    ggml_tensor * get_cpu_map(int32_t il) const;
 
     // the experts of w in the cache, nullptr if w is not cached
     ggml_tensor * get_experts(const ggml_tensor * w) const;

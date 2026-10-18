@@ -1617,11 +1617,19 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * cur, // ggml_tensor * b
           ggml_tensor * ids,
           ggml_tensor * w_s,
-          ggml_tensor * slots) const {
+          ggml_tensor * slots,
+          ggml_tensor * ids_cpu) const {
     // the experts in the MoE cache are selected by their slots
     ggml_tensor * res = slots == nullptr ?
         ggml_mul_mat_id(ctx0, w, cur, ids) :
         ggml_mul_mat_id(ctx0, moe_cache->get_experts(w), cur, slots);
+
+    // the experts the cache does not hold are computed on the CPU, the GPU reads its zero slot for them
+    if (ids_cpu != nullptr) {
+        ggml_tensor * res_cpu = ggml_mul_mat_id(ctx0, w, cur, ids_cpu);
+        ggml_backend_sched_set_tensor_backend(sched, res_cpu, backend_cpu);
+        res = ggml_add(ctx0, res, res_cpu);
+    }
 
     if (prec_policy) {
         prec_policy->apply(res);
@@ -2263,7 +2271,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     }
 
     // the experts of host-resident layers may be read from the MoE cache
-    ggml_tensor * slots = build_moe_cache_slots(selected_experts, up_exps, gate_exps, down_exps, gate_up_exps, il);
+    ggml_tensor * ids_cpu = nullptr;
+    ggml_tensor * slots = build_moe_cache_slots(selected_experts, up_exps, gate_exps, down_exps, gate_up_exps, il, &ids_cpu);
 
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
 
@@ -2279,7 +2288,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     if (gate_up_exps) {
         // merged gate_up path: one mul_mat_id, then split into gate and up views
-        ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, selected_experts, up_exps_s, slots); // [n_ff*2, n_expert_used, n_tokens]
+        ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, selected_experts, up_exps_s, slots, ids_cpu); // [n_ff*2, n_expert_used, n_tokens]
         cb(gate_up, "ffn_moe_gate_up", il);
 
         if (up_exps_s) {
@@ -2298,7 +2307,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(up, "ffn_moe_up", il);
     } else {
         // separate gate and up path
-        up = build_lora_mm_id(up_exps, cur, selected_experts, up_exps_s, slots); // [n_ff, n_expert_used, n_tokens]
+        up = build_lora_mm_id(up_exps, cur, selected_experts, up_exps_s, slots, ids_cpu); // [n_ff, n_expert_used, n_tokens]
         cb(up, "ffn_moe_up", il);
 
         if (up_exps_s) {
@@ -2311,7 +2320,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
 
         if (gate_exps) {
-            cur = build_lora_mm_id(gate_exps, cur, selected_experts, gate_exps_s, slots); // [n_ff, n_expert_used, n_tokens]
+            cur = build_lora_mm_id(gate_exps, cur, selected_experts, gate_exps_s, slots, ids_cpu); // [n_ff, n_expert_used, n_tokens]
             cb(cur, "ffn_moe_gate", il);
         } else {
             cur = up;
@@ -2412,7 +2421,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             GGML_ABORT("fatal error");
     }
 
-    experts = build_lora_mm_id(down_exps, cur, selected_experts, down_exps_s, slots); // [n_embd, n_expert_used, n_tokens]
+    experts = build_lora_mm_id(down_exps, cur, selected_experts, down_exps_s, slots, ids_cpu); // [n_embd, n_expert_used, n_tokens]
     if (arch == LLM_ARCH_MISTRAL4) {
         // src1 can exceed F16 range
         ggml_prec_set_src(experts, GGML_PREC_F32, 1);
@@ -2475,7 +2484,8 @@ ggml_tensor * llm_graph_context::build_moe_cache_slots(
          ggml_tensor * gate_exps,
          ggml_tensor * down_exps,
          ggml_tensor * gate_up_exps,
-                 int   il) const {
+                 int   il,
+         ggml_tensor ** ids_cpu) const {
     if (moe_cache == nullptr) {
         return nullptr;
     }
@@ -2504,6 +2514,15 @@ ggml_tensor * llm_graph_context::build_moe_cache_slots(
     }
     ggml_backend_sched_set_tensor_backend(sched, slots, moe_cache->backend(il));
     cb(slots, "ffn_moe_slots", il);
+
+    // the experts that are not resident are looked up in the CPU map and computed on the CPU
+    ggml_tensor * cpu_map = moe_cache->get_cpu_map(il);
+    if (cpu_map != nullptr && ids_cpu != nullptr) {
+        ggml_tensor * ids_cpu_rows = ggml_get_rows(ctx0, cpu_map, ids); // [1, n_expert_used*n_tokens], -1 for the resident experts
+        ggml_backend_sched_set_tensor_backend(sched, ids_cpu_rows, backend_cpu);
+        cb(ids_cpu_rows, "ffn_moe_ids_cpu", il);
+        *ids_cpu = ggml_reshape_2d(ctx0, ids_cpu_rows, selected_experts->ne[0], selected_experts->ne[1]);
+    }
 
     return ggml_reshape_2d(ctx0, slots, selected_experts->ne[0], selected_experts->ne[1]); // [n_expert_used, n_tokens]
 }

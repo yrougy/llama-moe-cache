@@ -1652,10 +1652,30 @@ static void ggml_compute_forward_mul_mat_id(
             for (int id = 0; id < n_ids; ++id) {
                 const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
 
-                assert(i02 >= 0 && i02 < n_as);
+                if (i02 < 0) {
+                    continue; // the row is computed by another op, see the zeroing below
+                }
+
+                assert(i02 < n_as);
 
                 MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = (struct mmid_row_mapping) {id, iid1};
                 matrix_row_counts[i02] += 1;
+            }
+        }
+    }
+
+    // the rows of the ids that select no matrix are never written above, zero them so they add nothing
+    for (int64_t iid1 = ith; iid1 < ids->ne[1]; iid1 += nth) {
+        for (int id = 0; id < n_ids; ++id) {
+            const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
+
+            if (i02 >= 0) {
+                continue;
+            }
+
+            float * row = (float *) ((char *) dst->data + id*nb1 + iid1*nb2);
+            for (int64_t i0 = 0; i0 < ne0; ++i0) {
+                row[i0] = 0.0f;
             }
         }
     }

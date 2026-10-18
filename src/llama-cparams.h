@@ -66,6 +66,8 @@ struct llama_cparams {
 
     int64_t moe_cache_pin_mib;      // MiB of the hottest non-resident experts locked in RAM, 0 = only fault them in
 
+    bool moe_cache_cpu_fallback;    // the experts not resident in the cache are computed on the CPU, the GPU reads a zero slot for them
+
     std::string moe_stats;          // write the per-(layer,expert) selection counts and residency of the cache to this file, empty = disabled
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer

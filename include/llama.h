@@ -406,6 +406,8 @@ extern "C" {
 
         int64_t moe_cache_pin_mib; // MiB of the hottest non-resident experts locked in RAM so they are never evicted, 0 = only fault them in [EXPERIMENTAL]
 
+        bool moe_cache_cpu_fallback; // compute the MoE experts that are not resident in the cache on the CPU, the GPU reads a zero slot for them [EXPERIMENTAL]
+
         const char * moe_stats; // write the per-(layer,expert) selection counts and residency of the MoE cache to this CSV file at context destruction, NULL = disabled [EXPERIMENTAL]
 
         // Abort callback
