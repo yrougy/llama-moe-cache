@@ -607,6 +607,8 @@ struct common_params {
 
     int32_t moe_cache_tail_skip = 0; // drop the non-resident MoE experts selected only at a rank at or above this value, their contribution is 0, 0 = disabled
 
+    int32_t moe_cache_adapt = 0; // re-rank the resident tier of a static MoE cache from the live routing counts every N cached tokens, 0 = disabled
+
     std::string moe_stats; // write the per-(layer,expert) selection counts and residency of the MoE cache to this CSV file, empty = disabled
 
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;

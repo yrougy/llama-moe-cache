@@ -2570,6 +2570,7 @@ common_params common_base_params_to_speculative(const common_params & params) {
     result.moe_profile_output.clear();
     result.moe_profile.clear();
     result.moe_cache_static = false;
+    result.moe_cache_adapt = 0;
     result.moe_stats.clear();
 
     // dflash/dspark decode the whole noise block in a single pass and sample every block position on the backend

@@ -37,6 +37,7 @@ struct moe_cache_lru {
     std::vector<int32_t> lo;    // [n_layer] first scratch slot of the layer
     std::vector<int32_t> hi;    // [n_layer] one past the last scratch slot of the layer
     std::vector<int32_t> chain; // [n_layer] chain used by the layer
+    std::vector<int32_t> tier_lo; // [n_layer] first pinned slot of a static cache layer, the tier re-ranking swaps experts inside its range
     std::vector<int32_t> head;  // [n_chain]
     std::vector<int32_t> tail;  // [n_chain]
 
@@ -69,6 +70,7 @@ struct moe_cache_lru {
         lo.assign(n_layer, 0);
         hi.assign(n_layer, n_slots);
         chain.assign(n_layer, 0);
+        tier_lo.assign(n_layer, 0);
         head.assign(n_layer, 0);
         tail.assign(n_layer, n_slots - 1);
         seen.assign(n_expert, 0);
@@ -243,8 +245,9 @@ static bool llama_moe_cache_is_host_weight(const ggml_tensor * t) {
 
 // the per-(layer,expert) routing counts written by --moe-profile-output
 // ranked[il] holds the experts of layer il in the order of descending use, ties by ascending index
+// counts[il*n_expert + e] holds the raw counts, they seed the moving average of the tier re-ranking
 static bool llama_moe_cache_load_profile(const char * path, int32_t n_layer, int32_t n_expert,
-        std::vector<std::vector<int32_t>> & ranked) {
+        std::vector<std::vector<int32_t>> & ranked, std::vector<uint64_t> & counts) {
     FILE * f = std::fopen(path, "r");
     if (f == nullptr) {
         LLAMA_LOG_WARN("%s: failed to open %s\n", __func__, path);
@@ -281,6 +284,7 @@ static bool llama_moe_cache_load_profile(const char * path, int32_t n_layer, int
     }
 
     ranked.assign(n_layer, {});
+    counts.assign((size_t) n_layer*n_expert, 0);
     for (int32_t il = 0; il < n_layer; ++il) {
         std::sort(heat[il].begin(), heat[il].end(), [](const auto & a, const auto & b) {
             if (a.first != b.first) {
@@ -290,6 +294,7 @@ static bool llama_moe_cache_load_profile(const char * path, int32_t n_layer, int
         });
         for (const auto & h : heat[il]) {
             ranked[il].push_back(h.second);
+            counts[(size_t) il*n_expert + h.second] = h.first;
         }
     }
 
@@ -345,6 +350,7 @@ struct llama_moe_cache::impl {
         int32_t n_extra = 1;              // slots past n_slots: the zero slot the GPU reads for the CPU experts, and the padding CUDA reads past the last one
         bool cpu_fallback = false;        // the experts that are not resident are computed on the CPU, nothing is uploaded
         int64_t max_batch_cached = max_batch; // tokens a batch can have before the group stops caching
+    int64_t adapt_done = 0; // tokens cached since this group's last tier re-ranking
         moe_cache_lru lru;
     };
 
@@ -407,6 +413,10 @@ struct llama_moe_cache::impl {
     std::vector<moe_cache_lru::fill> fills;
 
     std::vector<uint64_t> use; // [n_layer*n_expert] selections seen by the copy callback, the runtime routing counts
+
+    int32_t adapt_tokens = 0; // re-rank the resident tier of a static CPU-fallback cache every N cached tokens from the live routing counts, 0 = disabled
+    std::vector<uint64_t> prev_use; // [n_layer*n_expert] selection counts at the previous re-ranking
+    std::vector<uint64_t> heat;     // [n_layer*n_expert] exponential moving average of the per-window selection counts, what the tier is ranked by
 
     // slot maps in host memory
     ggml_context_ptr ctx_host;
@@ -649,13 +659,22 @@ struct llama_moe_cache::impl {
     }
 
     impl(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size,
-            const std::string & profile_path, bool static_mode_in, int64_t pin_mib, bool cpu_fallback_in, int32_t tail_skip_in) :
+            const std::string & profile_path, bool static_mode_in, int64_t pin_mib, bool cpu_fallback_in, int32_t tail_skip_in, int32_t adapt_tokens_in) :
             static_mode(static_mode_in), pin_bytes((int64_t) pin_mib*1024*1024), cpu_fallback(cpu_fallback_in), tail_skip(tail_skip_in), n_expert_used(model.hparams.n_expert_used_max()), layers(model.layers.size()),
             use(model.layers.size()*model.hparams.n_expert, 0) {
         if (tail_skip != 0 && (tail_skip < 1 || tail_skip >= n_expert_used)) {
             LLAMA_LOG_WARN("%s: MoE tail skip needs a rank between 1 and %d, disabled\n", __func__, n_expert_used - 1);
             tail_skip = 0;
         }
+        if (adapt_tokens_in > 0) {
+            if (!static_mode || !cpu_fallback) {
+                LLAMA_LOG_WARN("%s: MoE cache adaptation needs a static cache with the CPU fallback, disabled\n", __func__);
+            } else {
+                adapt_tokens = adapt_tokens_in;
+            }
+        }
+        prev_use.assign(use.size(), 0);
+        heat.assign(use.size(), 0);
         for (size_t i = 0; i < backends.size(); ++i) {
             const auto dev_type = ggml_backend_dev_type(ggml_backend_get_device(backends[i]));
             if (dev_type == GGML_BACKEND_DEVICE_TYPE_GPU || dev_type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
@@ -880,10 +899,15 @@ struct llama_moe_cache::impl {
 
         if (static_mode && !model.hparams.no_alloc) {
             std::vector<std::vector<int32_t>> ranked;
+            std::vector<uint64_t>             counts;
             if (profile_path.empty() ||
-                    !llama_moe_cache_load_profile(profile_path.c_str(), model.layers.size(), model.hparams.n_expert, ranked)) {
+                    !llama_moe_cache_load_profile(profile_path.c_str(), model.layers.size(), model.hparams.n_expert, ranked, counts)) {
                 LLAMA_LOG_WARN("%s: a static MoE cache needs a routing profile, using LRU instead\n", __func__);
                 static_mode = false;
+                adapt_tokens = 0;
+            }
+            if (adapt_tokens > 0) {
+                heat = std::move(counts); // the profile counts are the prior of the moving average: the tier only moves when the live routing persistently contradicts the seed
             }
             for (size_t ig = 0; static_mode && ig < groups.size(); ++ig) {
                 group & g = groups[ig];
@@ -905,9 +929,10 @@ struct llama_moe_cache::impl {
                     for (int32_t il : g.layers) {
                         const int32_t qi = q + (extra > 0 ? 1 : 0);
                         extra    -= (extra > 0 ? 1 : 0);
-                        g.lru.chain[il] = il;
-                        g.lru.lo[il]    = base;
-                        g.lru.hi[il]    = base + qi;
+                        g.lru.chain[il]   = il;
+                        g.lru.tier_lo[il] = base;
+                        g.lru.lo[il]      = base;
+                        g.lru.hi[il]      = base + qi;
                         base += qi;
                         g.lru.seed(il, ranked[il], qi);
                     }
@@ -938,6 +963,7 @@ struct llama_moe_cache::impl {
                     if (n_scratch < n_expert_used * n_layers) {
                         LLAMA_LOG_WARN("%s: MoE cache is too small to be static, using LRU instead\n", __func__);
                         static_mode = false;
+                        adapt_tokens = 0;
                         break;
                     }
 
@@ -953,9 +979,10 @@ struct llama_moe_cache::impl {
                         const int32_t sci = sc + (sc_extra > 0 ? 1 : 0);
                         extra    -= (extra > 0 ? 1 : 0);
                         sc_extra -= (sc_extra > 0 ? 1 : 0);
-                        g.lru.chain[il] = il;
-                        g.lru.lo[il]    = base;
-                        g.lru.hi[il]    = base + qi + sci;
+                        g.lru.chain[il]   = il;
+                        g.lru.tier_lo[il] = base;
+                        g.lru.lo[il]      = base;
+                        g.lru.hi[il]      = base + qi + sci;
                         base += qi + sci;
                         g.lru.seed(il, ranked[il], qi);
                         mb = std::min(mb, (int64_t) sci / n_expert_used);
@@ -1091,6 +1118,96 @@ struct llama_moe_cache::impl {
         return n;
     }
 
+    // live re-ranking of the resident tier of a static CPU-fallback cache: the tier follows an exponential moving
+    // average of the per-window selection counts, so a workload that drifts from the profile pulls its hot experts
+    // into the bank and pushes the cold ones back to the CPU, while one short noisy window cannot override the seed.
+    // a promoted expert is written into the slot of a demoted one, the maps are updated in place before this batch's
+    // slot map is copied to the device, so the batch sees one consistent tier
+    void adapt_tier(group & g, ggml_backend_t backend) {
+        const int32_t n_expert = g.lru.n_expert;
+        int32_t n_swap = 0;
+
+        std::vector<uint64_t> delta(n_expert);
+        std::vector<int32_t>  order(n_expert);
+        std::vector<char>     in_target(n_expert, 0);
+        std::vector<int32_t>  demote, promote;
+
+        for (int32_t il : g.layers) {
+            const int32_t tier0 = g.lru.tier_lo[il];
+            const int32_t q     = (g.cpu_fallback ? g.lru.hi[il] : g.lru.lo[il]) - tier0; // pinned slots of the layer
+            if (q <= 0) {
+                continue;
+            }
+            int32_t * slots = g.lru.slot_map[il];
+            const uint64_t * use_row  = use.data() + (size_t) il*n_expert;
+            uint64_t *       prev_row = prev_use.data() + (size_t) il*n_expert;
+            uint64_t *       heat_row = heat.data() + (size_t) il*n_expert;
+
+            for (int32_t e = 0; e < n_expert; ++e) {
+                delta[e]    = use_row[e] - prev_row[e];
+                prev_row[e] = use_row[e];
+                heat_row[e] = heat_row[e] - heat_row[e]/4 + delta[e]; // the window counts in, three quarters of the history out
+                order[e]    = e;
+            }
+            const auto resident = [&](int32_t e) { return slots[e] >= 0 && slots[e] < g.lru.n_slots; };
+            std::sort(order.begin(), order.end(), [&](int32_t a, int32_t b) {
+                if (heat_row[a] != heat_row[b]) {
+                    return heat_row[a] > heat_row[b];
+                }
+                if (resident(a) != resident(b)) {
+                    return resident(a); // on ties, keep the currently resident experts
+                }
+                return a < b;
+            });
+
+            std::fill(in_target.begin(), in_target.end(), 0);
+            for (int32_t i = 0; i < q; ++i) {
+                in_target[order[i]] = 1;
+            }
+            promote.clear();
+            demote.clear();
+            for (int32_t i = 0; i < q; ++i) {
+                if (!resident(order[i])) {
+                    promote.push_back(order[i]);
+                }
+            }
+            for (int32_t e = 0; e < n_expert && (int32_t) demote.size() < (int32_t) promote.size(); ++e) {
+                if (resident(e) && slots[e] >= tier0 && slots[e] < tier0 + q && !in_target[e]) {
+                    demote.push_back(e);
+                }
+            }
+            // bound the upload cost of a re-ranking: the tier converges over successive windows
+            const int32_t cap = q/4 > 0 ? q/4 : 1;
+            if ((int32_t) demote.size() > cap) {
+                demote.resize(cap);
+                promote.resize(cap);
+            }
+
+            int32_t * cpu = g.cpu_fallback ? (int32_t *) layers[il].cpu_map->data : nullptr;
+            for (size_t i = 0; i < demote.size(); ++i) {
+                const int32_t s  = slots[demote[i]];
+                const int32_t e1 = demote[i];
+                const int32_t e2 = promote[i];
+                slots[e1] = g.cpu_fallback ? g.lru.n_slots : -1;
+                slots[e2] = s;
+                g.lru.key_of[s] = il*n_expert + e2;
+                if (cpu != nullptr) {
+                    cpu[e1] = e1;
+                    cpu[e2] = -1;
+                }
+                for (size_t ip = 0; ip < layers[il].experts.size(); ++ip) {
+                    const ggml_tensor * w = layers[il].experts[ip];
+                    ggml_backend_tensor_set_async(backend, g.banks[ip],
+                            (const uint8_t *) w->data + (size_t) e2*w->nb[2], (size_t) s*w->nb[2], w->nb[2]);
+                }
+                n_swap++;
+            }
+        }
+        if (n_swap > 0) {
+            LLAMA_LOG_INFO("%s: %d experts swapped into the resident tier\n", __func__, n_swap);
+        }
+    }
+
     bool copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph) {
         const auto it = layer_of.find(src);
         if (it == layer_of.end()) {
@@ -1140,6 +1257,14 @@ struct llama_moe_cache::impl {
                 }
                 else if (tail_skip > 0 && (int32_t)(i % n_expert_used) >= tail_skip) {
                     n_skip++;
+                }
+            }
+            if (adapt_tokens > 0 && il == g.layers.front()) {
+                // the first layer of the group is copied once per cached batch: count the batch's tokens there
+                g.adapt_done += ids.size() / n_expert_used;
+                if (g.adapt_done >= adapt_tokens) {
+                    g.adapt_done = 0;
+                    adapt_tier(g, backend);
                 }
             }
             stats & st = ids.size() <= (size_t) 8*n_expert_used ? stats_small : stats_large;
@@ -1293,8 +1418,8 @@ struct llama_moe_cache::impl {
 };
 
 llama_moe_cache::llama_moe_cache(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size,
-        const std::string & profile_path, bool static_mode, int64_t pin_mib, bool cpu_fallback, int32_t tail_skip) :
-    pimpl(new impl(model, backends, bufts, size, profile_path, static_mode, pin_mib, cpu_fallback, tail_skip)) {
+        const std::string & profile_path, bool static_mode, int64_t pin_mib, bool cpu_fallback, int32_t tail_skip, int32_t adapt_tokens) :
+    pimpl(new impl(model, backends, bufts, size, profile_path, static_mode, pin_mib, cpu_fallback, tail_skip, adapt_tokens)) {
 }
 
 llama_moe_cache::~llama_moe_cache() = default;

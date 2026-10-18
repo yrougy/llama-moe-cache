@@ -70,6 +70,8 @@ struct llama_cparams {
 
     int32_t moe_cache_tail_skip;    // drop the non-resident experts selected only at a rank at or above this value, 0 = disabled
 
+    int32_t moe_cache_adapt;        // re-rank the resident tier of a static cache from the live routing counts every N cached tokens, 0 = disabled
+
     std::string moe_stats;          // write the per-(layer,expert) selection counts and residency of the cache to this file, empty = disabled
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer

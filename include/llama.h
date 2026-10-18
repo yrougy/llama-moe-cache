@@ -410,6 +410,8 @@ extern "C" {
 
         int32_t moe_cache_tail_skip; // drop the non-resident MoE experts selected only at a rank at or above this value, their contribution is 0, 0 = disabled [EXPERIMENTAL]
 
+        int32_t moe_cache_adapt; // re-rank the resident tier of a static MoE cache from the live routing counts every N cached tokens, 0 = disabled [EXPERIMENTAL]
+
         const char * moe_stats; // write the per-(layer,expert) selection counts and residency of the MoE cache to this CSV file at context destruction, NULL = disabled [EXPERIMENTAL]
 
         // Abort callback

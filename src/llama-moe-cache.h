@@ -19,8 +19,10 @@ public:
     // cpu_fallback computes the experts that are not resident on the CPU, the GPU reads a zero slot for them, so nothing is uploaded
     // tail_skip drops the non-resident experts selected only at a rank at or above this value: the CPU fallback skips
     // their ids, the other modes map them to the zero slot, 0 = disabled
+    // adapt_tokens re-ranks the resident tier of a static CPU-fallback cache from the live routing counts every N
+    // cached tokens, so a workload that drifts from the profile pulls its hot experts into the bank, 0 = disabled
     llama_moe_cache(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size,
-                     const std::string & profile_path, bool static_mode, int64_t pin_mib, bool cpu_fallback, int32_t tail_skip);
+                     const std::string & profile_path, bool static_mode, int64_t pin_mib, bool cpu_fallback, int32_t tail_skip, int32_t adapt_tokens);
     ~llama_moe_cache();
 
     // the device that caches layer il

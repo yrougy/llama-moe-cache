@@ -2839,6 +2839,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_CACHE_TAIL_SKIP"));
     add_opt(common_arg(
+        {"--moe-cache-adapt"}, "N",
+        "re-rank the resident tier of a static MoE cache from a moving average of the live routing counts every N "
+        "cached tokens: a workload that drifts from the profile pulls its hot experts into the bank and pushes the "
+        "cold ones back to the CPU (default: 0, disabled, requires --moe-cache-static and --moe-cache-cpu-fallback)\n"
+        "(example: --moe-cache-adapt 512 re-ranks the tier every 512 generated tokens)",
+        [](common_params & params, int value) {
+            params.moe_cache_adapt = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_CACHE_ADAPT"));
+    add_opt(common_arg(
         {"--moe-stats"}, "FILE",
         "write the per-(layer,expert) MoE selection counts and cache residency to this CSV file when the context is destroyed, "
         "requires --moe-cache-mib (default: disabled)\n"
