@@ -501,7 +501,13 @@ llama_context::llama_context(
         }
 
         if (!cparams.moe_profile_output.empty()) {
-            moe_profile = std::make_unique<llama_moe_profile>(model, cparams.n_batch, cparams.moe_profile_output);
+            if (cparams.moe_cache_size > 0) {
+                // the host copies of the profile change the splits of the scheduler, and the MoE cache lookup needs
+                // the expert ids to be computed in an earlier split: profile the model without the cache instead
+                LLAMA_LOG_WARN("%s: --moe-profile-output is ignored while the MoE cache is active, use --moe-cache-mib 0 to profile\n", __func__);
+            } else {
+                moe_profile = std::make_unique<llama_moe_profile>(model, cparams.n_batch, cparams.moe_profile_output);
+            }
         }
 
         sched_reserve();
