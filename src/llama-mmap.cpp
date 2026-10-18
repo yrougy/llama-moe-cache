@@ -583,32 +583,51 @@ struct llama_mmap::impl {
         *last  = std::min((*last + page_size - 1) & ~(page_size - 1), size);
     }
 
+    // the mapped subranges of [first, last): the holes left by unmap are skipped, madvise and mlock fail on them
+    std::vector<std::pair<size_t, size_t>> mapped_subranges(size_t first, size_t last) const {
+        std::vector<std::pair<size_t, size_t>> res;
+        for (const auto & frag : mapped_fragments) {
+            if (frag.second <= first) {
+                continue;
+            }
+            if (frag.first >= last) {
+                break;
+            }
+            res.emplace_back(std::max(frag.first, first), std::min(frag.second, last));
+        }
+        return res;
+    }
+
     void populate(size_t first, size_t last) {
         align_full(&first, &last, size);
-        const size_t len = last - first;
-        if (len == 0) {
-            return;
-        }
+        for (const auto & sub : mapped_subranges(first, last)) {
+            const size_t len = sub.second - sub.first;
+            if (len == 0) {
+                continue;
+            }
 #ifdef MADV_POPULATE_READ
-        if (madvise((char *) addr + first, len, MADV_POPULATE_READ)) {
-            LLAMA_LOG_WARN("warning: madvise(MADV_POPULATE_READ) failed: %s\n", strerror(errno));
-        }
+            if (madvise((char *) addr + sub.first, len, MADV_POPULATE_READ)) {
+                LLAMA_LOG_WARN("warning: madvise(MADV_POPULATE_READ) failed: %s\n", strerror(errno));
+            }
 #else
-        if (posix_madvise((char *) addr + first, len, POSIX_MADV_WILLNEED)) {
-            LLAMA_LOG_WARN("warning: posix_madvise(.., POSIX_MADV_WILLNEED) failed: %s\n", strerror(errno));
-        }
+            if (posix_madvise((char *) addr + sub.first, len, POSIX_MADV_WILLNEED)) {
+                LLAMA_LOG_WARN("warning: posix_madvise(.., POSIX_MADV_WILLNEED) failed: %s\n", strerror(errno));
+            }
 #endif
+        }
     }
 
     bool pin(size_t first, size_t last) {
         align_full(&first, &last, size);
-        const size_t len = last - first;
-        if (len == 0) {
-            return true;
-        }
-        if (mlock((char *) addr + first, len)) {
-            LLAMA_LOG_WARN("warning: mlock failed on a %zu-byte range: %s\n", len, strerror(errno));
-            return false;
+        for (const auto & sub : mapped_subranges(first, last)) {
+            const size_t len = sub.second - sub.first;
+            if (len == 0) {
+                continue;
+            }
+            if (mlock((char *) addr + sub.first, len)) {
+                LLAMA_LOG_WARN("warning: mlock failed on a %zu-byte range: %s\n", len, strerror(errno));
+                return false;
+            }
         }
         return true;
     }
@@ -616,12 +635,14 @@ struct llama_mmap::impl {
     // drop the pages from the page cache, the mapping stays valid so a later read re-faults from disk
     void release(size_t first, size_t last) {
         align_full(&first, &last, size);
-        const size_t len = last - first;
-        if (len == 0) {
-            return;
-        }
-        if (madvise((char *) addr + first, len, MADV_DONTNEED)) {
-            LLAMA_LOG_WARN("warning: madvise(MADV_DONTNEED) failed on a %zu-byte range: %s\n", len, strerror(errno));
+        for (const auto & sub : mapped_subranges(first, last)) {
+            const size_t len = sub.second - sub.first;
+            if (len == 0) {
+                continue;
+            }
+            if (madvise((char *) addr + sub.first, len, MADV_DONTNEED)) {
+                LLAMA_LOG_WARN("warning: madvise(MADV_DONTNEED) failed on a %zu-byte range: %s\n", len, strerror(errno));
+            }
         }
     }
 
