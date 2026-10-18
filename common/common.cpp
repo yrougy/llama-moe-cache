@@ -1742,6 +1742,8 @@ struct llama_context_params common_context_params_to_llama(const common_params &
 
     cparams.moe_cache_size = params.moe_cache_size;
 
+    cparams.moe_profile_output = params.moe_profile_output.empty() ? nullptr : params.moe_profile_output.c_str();
+
     return cparams;
 }
 

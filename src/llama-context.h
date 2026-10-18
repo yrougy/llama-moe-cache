@@ -8,6 +8,7 @@
 #include "llama-impl.h"
 #include "llama-memory.h"
 #include "llama-moe-cache.h"
+#include "llama-moe-profile.h"
 
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
@@ -254,7 +255,7 @@ public:
     llm_graph_result * get_gf_res_reserve() const;
 
     // returns the result of ggml_backend_sched_graph_compute_async execution
-    ggml_status graph_compute(ggml_cgraph * gf, bool batched);
+    ggml_status graph_compute(ggml_cgraph * gf, bool batched, const llm_graph_result * res = nullptr);
 
     // reserve a graph with a dummy ubatch of the specified size
     ggml_cgraph * graph_reserve(
@@ -302,6 +303,12 @@ private:
 
     llama_memory_ptr memory;
     llama_moe_cache_ptr moe_cache;
+    llama_moe_profile_ptr moe_profile;
+
+    // major page faults across the first decode ubatch, 0 means the decode hot path touched no disk
+    size_t majflt_start  = 0;
+    size_t majflt_end    = 0;
+    bool   majflt_marked = false;
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};

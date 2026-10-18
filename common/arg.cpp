@@ -2787,6 +2787,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_CACHE_MIB"));
     add_opt(common_arg(
+        {"--moe-profile-output"}, "FILE",
+        "write the per-(layer,expert) MoE routing counts to this CSV file when the context is destroyed, "
+        "used to seed --moe-cache-mib from real usage (default: disabled)\n"
+        "(example: --moe-profile-output moe_profile.csv)",
+        [](common_params & params, const std::string & value) {
+            params.moe_profile_output = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_PROFILE_OUTPUT"));
+    add_opt(common_arg(
         {"-ncffn", "--n-cpu-ffn"}, "N",
         "keep the dense FFN weights of the first N layers in the CPU\n"
         "(dense models; for MoE expert weights use --n-cpu-moe)",

@@ -34,6 +34,29 @@ static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
     throw std::runtime_error("Unsupported ctx type");
 }
 
+// major page faults of the process, i.e. the pages the kernel had to read from a device to serve them
+static size_t llama_read_majflt() {
+    FILE * f = std::fopen("/proc/self/stat", "r");
+    if (!f) {
+        return 0;
+    }
+    char buf[1024];
+    size_t n = std::fread(buf, 1, sizeof(buf) - 1, f);
+    std::fclose(f);
+    buf[n] = '\0';
+    // the comm field is in parentheses and may contain spaces
+    char * p = std::strrchr(buf, ')');
+    if (!p) {
+        return 0;
+    }
+    int v[12] = {0};
+    if (std::sscanf(p + 2, "%d %d %d %d %d %d %d %d %d %d %d %d",
+            &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6], &v[7], &v[8], &v[9], &v[10], &v[11]) < 12) {
+        return 0;
+    }
+    return v[11]; // majflt
+}
+
 struct llm_fused_op_probe {
     llm_fused_op op;
     const char * name;
@@ -276,6 +299,7 @@ llama_context::llama_context(
     cparams.op_offload     = params.op_offload;
     cparams.kv_unified     = params.kv_unified;
     cparams.moe_cache_size = params.moe_cache_size;
+    cparams.moe_profile_output = params.moe_profile_output ? params.moe_profile_output : std::string();
 
     // initialized later
     cparams.pipeline_parallel = false;
@@ -469,6 +493,10 @@ llama_context::llama_context(
             moe_cache = std::make_unique<llama_moe_cache>(model, backend_ptrs, backend_buft, cparams.moe_cache_size);
         }
 
+        if (!cparams.moe_profile_output.empty()) {
+            moe_profile = std::make_unique<llama_moe_profile>(model, cparams.n_batch, cparams.moe_profile_output);
+        }
+
         sched_reserve();
 
         if (!cparams.flash_attn) {
@@ -511,6 +539,10 @@ llama_context::~llama_context() {
         }
     }
     ggml_opt_free(opt_ctx);
+
+    if (majflt_marked) {
+        LLAMA_LOG_INFO("%s: major page faults in the first decode ubatch = %zu\n", __func__, majflt_end - majflt_start);
+    }
 }
 
 void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs) {
@@ -1474,7 +1506,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
-    const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    const size_t majflt_before = majflt_marked ? 0 : llama_read_majflt();
+
+    const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1, res);
+    if (!majflt_marked) {
+        majflt_start = majflt_before;
+        majflt_end   = llama_read_majflt();
+        majflt_marked = true;
+    }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -2599,6 +2638,7 @@ llm_graph_params llama_context::graph_params(
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
         /*.moe_cache   =*/ moe_cache.get(),
+        /*.moe_profile =*/ moe_profile.get(),
         /*.prec_policy =*/ &model.prec_policy,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
@@ -2609,7 +2649,8 @@ llm_graph_params llama_context::graph_params(
 
 ggml_status llama_context::graph_compute(
             ggml_cgraph * gf,
-                   bool   batched) {
+                   bool   batched,
+    const llm_graph_result * res) {
     int n_threads        = batched ? cparams.n_threads_batch : cparams.n_threads;
     ggml_threadpool_t tp = batched ? threadpool_batch        : threadpool;
 
@@ -2631,6 +2672,12 @@ ggml_status llama_context::graph_compute(
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
+    }
+
+    if (moe_profile && res) {
+        for (const auto & [il, n_tokens] : res->get_moe_profiled()) {
+            moe_profile->accumulate(il, n_tokens);
+        }
     }
 
     // fprintf(stderr, "splits: %d\n", ggml_backend_sched_get_n_splits(sched));
@@ -3876,6 +3923,7 @@ llama_context_params llama_context_default_params() {
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,
         /*.moe_cache_size              =*/ 0,
+        /*.moe_profile_output          =*/ nullptr,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,

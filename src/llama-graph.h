@@ -22,6 +22,7 @@ struct llama_layer;
 struct llama_prec_policy;
 
 class llama_moe_cache;
+class llama_moe_profile;
 
 struct llama_memory_context_i;
 
@@ -800,6 +801,7 @@ struct llm_graph_params {
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
     const llama_moe_cache        * moe_cache;
+    const llama_moe_profile      * moe_profile;
 
     const llama_prec_policy * prec_policy = nullptr;
 
@@ -945,6 +947,11 @@ public:
 
     const std::vector<llm_graph_fused_node> & get_fused_nodes() const { return fused_nodes; }
 
+    // layers whose routing the graph copies to the MoE profile, recorded during the graph build
+    void add_moe_profile_layer(int32_t il, int64_t n_tokens) { moe_profiled.emplace_back(il, n_tokens); }
+
+    const std::vector<std::pair<int32_t, int64_t>> & get_moe_profiled() const { return moe_profiled; }
+
     void set_params(const llm_graph_params & params);
 
     // important graph nodes
@@ -964,6 +971,8 @@ public:
 
     std::vector<llm_graph_input_ptr> inputs;
     std::vector<llm_graph_fused_node> fused_nodes;
+
+    std::vector<std::pair<int32_t, int64_t>> moe_profiled; // (layer, n_tokens) of the MoE profile copies
 
     ggml_context_ptr ctx_compute;
 
@@ -1045,6 +1054,7 @@ struct llm_graph_context {
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
     const llama_moe_cache        * moe_cache;
+    const llama_moe_profile      * moe_profile;
 
     const llama_prec_policy * prec_policy;
 

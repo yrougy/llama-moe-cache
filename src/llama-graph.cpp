@@ -3,6 +3,7 @@
 #include "llama-impl.h"
 #include "llama-model.h"
 #include "llama-moe-cache.h"
+#include "llama-moe-profile.h"
 #include "llama-batch.h"
 #include "llama-cparams.h"
 #include "llama-sampler.h"
@@ -1396,6 +1397,7 @@ void llm_graph_result::reset() {
 
     inputs.clear();
     fused_nodes.clear();
+    moe_profiled.clear();
 
     buf_compute_meta.resize(ggml_tensor_overhead()*max_nodes + ggml_graph_overhead_custom(max_nodes, false));
 
@@ -1547,6 +1549,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     mctx             (params.mctx),
     cross            (params.cross),
     moe_cache        (params.moe_cache),
+    moe_profile      (params.moe_profile),
     prec_policy      (params.prec_policy),
     samplers         (params.samplers),
     cb_func          (params.cb),
@@ -2237,6 +2240,27 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     //call early so that topk-moe can be used
     ggml_build_forward_expand(gf, weights);
+
+    // the routing profile: the ids and the weights are copied to host tensors, the scheduler starts a CPU split for the copies
+    if (moe_profile != nullptr) {
+        ggml_tensor * prof_ids = moe_profile->get_ids(il, n_tokens);
+        ggml_tensor * prof_w   = moe_profile->get_weights(il, n_tokens);
+        if (prof_ids != nullptr && prof_w != nullptr) {
+            ggml_tensor * ids = selected_experts;
+            if (!ggml_is_contiguous(ids)) {
+                ids = ggml_cont(ctx0, ids);
+            }
+            ggml_tensor * cpy_ids = ggml_cpy(ctx0, ids, prof_ids);
+            ggml_tensor * cpy_w   = ggml_cpy(ctx0, weights, prof_w);
+            ggml_backend_sched_set_tensor_backend(sched, prof_ids, backend_cpu);
+            ggml_backend_sched_set_tensor_backend(sched, prof_w,   backend_cpu);
+            ggml_build_forward_expand(gf, cpy_ids);
+            ggml_build_forward_expand(gf, cpy_w);
+            cb(cpy_ids, "ffn_moe_profile_ids", il);
+            cb(cpy_w,   "ffn_moe_profile_weights", il);
+            res->add_moe_profile_layer(il, n_tokens);
+        }
+    }
 
     // the experts of host-resident layers may be read from the MoE cache
     ggml_tensor * slots = build_moe_cache_slots(selected_experts, up_exps, gate_exps, down_exps, gate_up_exps, il);
