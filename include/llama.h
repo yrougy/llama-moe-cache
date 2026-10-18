@@ -408,6 +408,8 @@ extern "C" {
 
         bool moe_cache_cpu_fallback; // compute the MoE experts that are not resident in the cache on the CPU, the GPU reads a zero slot for them [EXPERIMENTAL]
 
+        int32_t moe_cache_tail_skip; // drop the non-resident MoE experts selected only at a rank at or above this value, their contribution is 0, 0 = disabled [EXPERIMENTAL]
+
         const char * moe_stats; // write the per-(layer,expert) selection counts and residency of the MoE cache to this CSV file at context destruction, NULL = disabled [EXPERIMENTAL]
 
         // Abort callback

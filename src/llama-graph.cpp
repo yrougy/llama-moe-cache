@@ -2522,6 +2522,11 @@ ggml_tensor * llm_graph_context::build_moe_cache_slots(
         ggml_backend_sched_set_tensor_backend(sched, ids_cpu_rows, backend_cpu);
         cb(ids_cpu_rows, "ffn_moe_ids_cpu", il);
         *ids_cpu = ggml_reshape_2d(ctx0, ids_cpu_rows, selected_experts->ne[0], selected_experts->ne[1]);
+        if (moe_cache->tail_skip() > 0) {
+            // the CPU op skips the ids at a rank at or above tail_skip and zeros their rows: the tail picks of the
+            // non-resident experts contribute nothing, the GPU has already read the zero slot for them
+            (*ids_cpu)->extra = (void *) (intptr_t) moe_cache->tail_skip();
+        }
     }
 
     return ggml_reshape_2d(ctx0, slots, selected_experts->ne[0], selected_experts->ne[1]); // [n_expert_used, n_tokens]

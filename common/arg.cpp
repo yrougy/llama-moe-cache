@@ -2830,6 +2830,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_CACHE_CPU_FALLBACK"));
     add_opt(common_arg(
+        {"--moe-cache-tail-skip"}, "N",
+        "drop the non-resident experts that the router selects only at a rank at or above N (0-indexed): neither the CPU "
+        "nor the GPU computes them, their contribution is 0 (default: 0, disabled, requires --moe-cache-mib)\n"
+        "(example: --moe-cache-tail-skip 6 drops the 7th and 8th picks of the router when they are not resident)",
+        [](common_params & params, int value) {
+            params.moe_cache_tail_skip = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_CACHE_TAIL_SKIP"));
+    add_opt(common_arg(
         {"--moe-stats"}, "FILE",
         "write the per-(layer,expert) MoE selection counts and cache residency to this CSV file when the context is destroyed, "
         "requires --moe-cache-mib (default: disabled)\n"

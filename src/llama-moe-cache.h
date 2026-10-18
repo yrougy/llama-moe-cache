@@ -17,8 +17,10 @@ public:
     // profile_path seeds the cache from the routing counts of a --moe-profile-output CSV, static_mode then keeps those experts resident
     // pin_mib locks the hottest experts that are not resident in RAM, 0 = only fault them in without locking
     // cpu_fallback computes the experts that are not resident on the CPU, the GPU reads a zero slot for them, so nothing is uploaded
+    // tail_skip drops the non-resident experts selected only at a rank at or above this value: the CPU fallback skips
+    // their ids, the other modes map them to the zero slot, 0 = disabled
     llama_moe_cache(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size,
-                     const std::string & profile_path, bool static_mode, int64_t pin_mib, bool cpu_fallback);
+                     const std::string & profile_path, bool static_mode, int64_t pin_mib, bool cpu_fallback, int32_t tail_skip);
     ~llama_moe_cache();
 
     // the device that caches layer il
@@ -29,6 +31,9 @@ public:
 
     // the map of the experts of layer il that the CPU computes, nullptr if the cache has no CPU fallback
     ggml_tensor * get_cpu_map(int32_t il) const;
+
+    // the non-resident experts selected only at a rank at or above this value are dropped, 0 = disabled
+    int32_t tail_skip() const;
 
     // the experts of w in the cache, nullptr if w is not cached
     ggml_tensor * get_experts(const ggml_tensor * w) const;

@@ -1585,6 +1585,9 @@ static void ggml_compute_forward_mul_mat_id(
     const int n_ids = ids->ne[0]; // n_expert_used
     const int n_as  = ne02;       // n_expert
 
+    // the MoE CPU fallback stores the rank at or above which the ids are skipped in ids->extra, NULL = no skip
+    const int tail_skip = ids->extra ? (int) (intptr_t) ids->extra : n_ids;
+
     void * wdata_cur = params->wdata;
 
     if (src1->type != vec_dot_type) {
@@ -1652,8 +1655,8 @@ static void ggml_compute_forward_mul_mat_id(
             for (int id = 0; id < n_ids; ++id) {
                 const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
 
-                if (i02 < 0) {
-                    continue; // the row is computed by another op, see the zeroing below
+                if (i02 < 0 || id >= tail_skip) {
+                    continue; // the row is computed by another op or dropped by the tail skip, see the zeroing below
                 }
 
                 assert(i02 < n_as);
@@ -1669,7 +1672,7 @@ static void ggml_compute_forward_mul_mat_id(
         for (int id = 0; id < n_ids; ++id) {
             const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
 
-            if (i02 >= 0) {
+            if (i02 >= 0 && id < tail_skip) {
                 continue;
             }
 

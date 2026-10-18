@@ -605,6 +605,8 @@ struct common_params {
 
     bool moe_cache_cpu_fallback = false; // the MoE experts that are not resident in the cache are computed on the CPU, the GPU reads a zero slot for them
 
+    int32_t moe_cache_tail_skip = 0; // drop the non-resident MoE experts selected only at a rank at or above this value, their contribution is 0, 0 = disabled
+
     std::string moe_stats; // write the per-(layer,expert) selection counts and residency of the MoE cache to this CSV file, empty = disabled
 
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;

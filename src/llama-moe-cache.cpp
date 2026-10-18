@@ -15,6 +15,11 @@
 #include <unordered_map>
 #include <vector>
 
+#ifdef __unix__
+#include <sys/resource.h>
+#include <unistd.h>
+#endif
+
 namespace {
 
 // LRU of the experts of a group of layers, the slot of each expert is kept in the slot map of its layer
@@ -39,6 +44,12 @@ struct moe_cache_lru {
     uint32_t seen_gen = 0;
     std::vector<int32_t> uniq;
 
+    // tail_skip: the experts selected only at a rank at or above this value are dropped, 0 = disabled; n_expert_used
+    // gives the rank of an id in the flat ids array; minrank[e] is the best rank of e in the current ids
+    int32_t tail_skip = 0;
+    int32_t n_expert_used = 0;
+    std::vector<int16_t> minrank; // [n_expert]
+
     // static mode: the first slots of each layer range hold the experts seeded from the routing profile and are
     // never evicted, the rest of the range is an LRU serving the experts the profile did not rank resident
     bool     static_mode = false;
@@ -61,6 +72,7 @@ struct moe_cache_lru {
         head.assign(n_layer, 0);
         tail.assign(n_layer, n_slots - 1);
         seen.assign(n_expert, 0);
+        minrank.resize(n_expert);
     }
 
     // give a slot to each expert of layer il in the order of ranked, at most q of them
@@ -119,12 +131,15 @@ struct moe_cache_lru {
     }
 
     // give a slot to each expert selected by ids in layer il, the misses evict the least recently used scratch slot
-    // in static mode the seeded experts are never evicted, the misses take the rotating scratch slots
+    // in static mode the seeded experts are never evicted, the rest of the range is an LRU serving the experts the profile did not rank resident
+    // an expert that is only selected at a rank at or above tail_skip and is not resident is dropped: its slot becomes
+    // the zero slot the GPU reads, so its contribution is 0 and nothing is uploaded for it
     // returns false if the ids select more distinct experts than there are slots
-    bool plan(int32_t il, const int32_t * ids, size_t n_ids, std::vector<fill> & fills, size_t & n_hit, size_t & n_scratch) {
+    bool plan(int32_t il, const int32_t * ids, size_t n_ids, std::vector<fill> & fills, size_t & n_hit, size_t & n_scratch, size_t & n_skip) {
         fills.clear();
         n_hit = 0;
         n_scratch = 0;
+        n_skip = 0;
 
         const int32_t c = chain[il];
 
@@ -135,30 +150,47 @@ struct moe_cache_lru {
         uniq.clear();
         for (size_t i = 0; i < n_ids; ++i) {
             GGML_ASSERT(ids[i] >= 0 && ids[i] < n_expert);
-            if (seen[ids[i]] != seen_gen) {
-                seen[ids[i]] = seen_gen;
-                uniq.push_back(ids[i]);
+            const int32_t e = ids[i];
+            if (seen[e] != seen_gen) {
+                seen[e] = seen_gen;
+                uniq.push_back(e);
+                minrank[e] = (int16_t) n_expert_used;
             }
-        }
-        if (uniq.size() > (size_t) (hi[il] - lo[il])) {
-            return false;
+            const int16_t r = (int16_t)(i % n_expert_used);
+            if (r < minrank[e]) {
+                minrank[e] = r;
+            }
         }
 
         int32_t * slots = slot_map[il];
 
+        size_t n_need = 0;
+        for (int32_t e : uniq) {
+            if (slots[e] >= 0 && slots[e] < n_slots) {
+                n_hit++;
+            }
+            else if (tail_skip > 0 && minrank[e] >= tail_skip) {
+                slots[e] = n_slots; // the zero slot, the GPU reads it and adds nothing
+                n_skip++;
+            }
+            else {
+                n_need++;
+            }
+        }
+        if (n_hit + n_need > (size_t) (hi[il] - lo[il])) {
+            return false;
+        }
+
         // hits go to the tail first, so the head can be evicted below
         for (int32_t e : uniq) {
-            if (slots[e] >= 0) {
-                if (slots[e] >= lo[il]) {
-                    touch(slots[e], il);
-                }
-                n_hit++;
+            if (slots[e] >= lo[il] && slots[e] < n_slots) {
+                touch(slots[e], il);
             }
         }
         // sorted misses usually get consecutive slots, so the uploads can be merged
         std::sort(uniq.begin(), uniq.end());
         for (int32_t e : uniq) {
-            if (slots[e] >= 0) {
+            if (slots[e] >= 0 && slots[e] < n_slots) {
                 continue;
             }
             const int32_t s = head[c];
@@ -266,6 +298,26 @@ static bool llama_moe_cache_load_profile(const char * path, int32_t n_layer, int
     return true;
 }
 
+// the RAM the system can fault in, 0 if unknown
+static int64_t llama_moe_cache_ram_available(void) {
+#ifdef __linux__
+    FILE * f = std::fopen("/proc/meminfo", "r");
+    if (f == nullptr) {
+        return 0;
+    }
+    char line[256];
+    while (std::fgets(line, sizeof(line), f)) {
+        unsigned long long kb;
+        if (std::sscanf(line, "MemAvailable: %llu kB", &kb) == 1) {
+        std::fclose(f);
+        return (int64_t) kb * 1024;
+        }
+    }
+    std::fclose(f);
+#endif
+    return 0;
+}
+
 }
 
 struct llama_moe_cache::impl {
@@ -314,12 +366,14 @@ struct llama_moe_cache::impl {
         size_t misses  = 0;
         size_t bytes   = 0;
         size_t scratch = 0; // misses that took a scratch slot, the experts the profile did not seed resident
+        size_t skipped = 0; // misses that tail_skip dropped instead of computing them on the CPU
     };
 
     static constexpr int64_t max_batch = 32;
 
     // in static mode each layer's scratch pool serves this many tokens, batches above it are not cached
-    static constexpr int64_t max_batch_scratch = 1;
+    // 4 = the size of a verified MTP draft batch, so speculative decoding stays on the cached path
+    static constexpr int64_t max_batch_scratch = 4;
 
     // above this batch size the GPU uses the matrix-multiplication path with ids, whose inverse map has no entry for
     // an expert that is not in the cache, so a cached batch must stay in the vector path, which reads the zero slot
@@ -332,6 +386,10 @@ struct llama_moe_cache::impl {
 
     // the experts that are not resident in the cache are computed on the CPU, the GPU reads a zero slot for them
     bool cpu_fallback;
+
+    // with the CPU fallback, the non-resident experts selected at a rank at or above this value are skipped: the CPU op
+    // skips their ids and the GPU reads the zero slot for them, so their contribution is 0
+    int32_t tail_skip;
 
     int32_t n_expert_used;
 
@@ -429,12 +487,12 @@ struct llama_moe_cache::impl {
         };
 
         std::vector<expert_range> cold; // resident experts, their pages can be dropped
-        std::vector<expert_range> warm; // the complement, it must stay readable from RAM
         for (const expert_range & r : ranges) {
-            (r.resident ? cold : warm).push_back(r);
+            if (r.resident) {
+                cold.push_back(r);
+            }
         }
         std::sort(cold.begin(), cold.end(), by_file_pos);
-        std::sort(warm.begin(), warm.end(), by_file_pos);
 
         const double mib = 1024.0*1024.0;
 
@@ -444,14 +502,17 @@ struct llama_moe_cache::impl {
             cold_bytes += m.second.second - m.second.first;
         }
 
-        size_t warm_bytes = 0;
-        for (const auto & m : merge(warm)) {
-            m.first->populate(m.second.first, m.second.second);
-            warm_bytes += m.second.second - m.second.first;
+        // the complement must fit in the RAM the system can actually give: fault in the hottest experts first and
+        // stop at the budget, the coldest ones stay cold and their misses read the GGUF from disk
+        int64_t budget = llama_moe_cache_ram_available();
+        if (budget > 0) {
+            budget -= 1024*1024*1024; // keep a margin for the process itself
+        } else {
+            budget = INT64_MAX / 4; // the available RAM is unknown, fault in everything
         }
 
         // the bytes of the GGUF that are not expert tensors of the cached layers are read on a cold cache during decode,
-        // fault them in now so the decode hot path never goes to the disk for them
+        // fault them in first so the decode hot path never goes to the disk for them
         size_t rest_bytes = 0;
         {
             std::vector<expert_range> all = ranges;
@@ -480,8 +541,73 @@ struct llama_moe_cache::impl {
                 flush(pos, mm->size());
             }
         }
+        budget -= (int64_t) rest_bytes;
+
+        // select the ranges of the complement to fault in, the hottest first, until the budget is exhausted
+        std::vector<char> selected(ranges.size(), 0);
+        size_t warm_bytes = 0;
+        size_t left_bytes = 0; // the complement left out of RAM, its misses read the disk
+        auto select = [&](int32_t ir) {
+            const size_t len = ranges[ir].last - ranges[ir].first;
+            if ((int64_t) len > budget) {
+                left_bytes += len;
+                return;
+            }
+            selected[ir] = 1;
+            warm_bytes   += len;
+            budget       -= (int64_t) len;
+        };
+        for (size_t il = 0; il < model.layers.size(); ++il) {
+            if (layers[il].ig < 0) {
+                continue;
+            }
+            for (const int32_t e : ranked[il]) {
+                for (const int32_t ir : idx[il*n_expert + e]) {
+                    if (!ranges[ir].resident) {
+                        select(ir);
+                    }
+                }
+            }
+        }
+        // the experts without routing data in the profile, in file order
+        for (size_t ir = 0; ir < ranges.size(); ++ir) {
+            if (!ranges[ir].resident && !selected[ir]) {
+                select((int32_t) ir);
+            }
+        }
+
+        // merge the selected ranges so one system call covers as many experts as possible
+        std::vector<expert_range> warm;
+        for (size_t ir = 0; ir < ranges.size(); ++ir) {
+            if (selected[ir]) {
+                warm.push_back(ranges[ir]);
+            }
+        }
+        std::sort(warm.begin(), warm.end(), by_file_pos);
+        for (const auto & m : merge(warm)) {
+            m.first->populate(m.second.first, m.second.second);
+        }
 
         // lock the hottest experts of the complement, stop at the limit of the process
+        // the locked bytes must also fit in RLIMIT_MEMLOCK, mlock fails with ENOMEM beyond it; the accounting uses
+        // the page-aligned lengths that mlock actually locks, so only a small slack is kept
+        int64_t pin_limit = pin_bytes;
+#ifdef __unix__
+        {
+            struct rlimit rl;
+            if (getrlimit(RLIMIT_MEMLOCK, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY) {
+                const int64_t cap = (int64_t) rl.rlim_cur - 4*1024*1024;
+                if (cap < pin_limit) {
+                    pin_limit = cap;
+                }
+            }
+        }
+#endif
+#ifdef __unix__
+        const size_t page_size = sysconf(_SC_PAGESIZE);
+#else
+        const size_t page_size = 4096;
+#endif
         size_t  pinned = 0;
         size_t  n_pinned = 0;
         bool    stop = false;
@@ -492,10 +618,13 @@ struct llama_moe_cache::impl {
             for (const int32_t e : ranked[il]) {
                 for (const int32_t ir : idx[il*n_expert + e]) {
                     const expert_range & r = ranges[ir];
-                    if (r.resident) {
+                    if (r.resident || !selected[ir]) {
                         continue;
                     }
-                    if ((int64_t) pinned + (int64_t) (r.last - r.first) > pin_bytes) {
+                    const size_t first_a = r.first & ~(page_size - 1);
+                    const size_t last_a  = std::min((r.last + page_size - 1) & ~(page_size - 1), r.mm->size());
+                    const size_t len     = last_a > first_a ? last_a - first_a : 0;
+                    if ((int64_t) pinned + (int64_t) len > pin_limit) {
                         stop = true;
                         break;
                     }
@@ -503,7 +632,7 @@ struct llama_moe_cache::impl {
                         stop = true;
                         break;
                     }
-                    pinned   += r.last - r.first;
+                    pinned   += len;
                     n_pinned++;
                 }
                 if (stop) {
@@ -514,12 +643,19 @@ struct llama_moe_cache::impl {
 
         LLAMA_LOG_INFO("%s: MoE complement: %.2f MiB faulted into RAM, %.2f MiB of the rest faulted into RAM, %.2f MiB pinned in %zu experts, %.2f MiB of resident pages dropped\n",
                 __func__, warm_bytes/mib, rest_bytes/mib, pinned/mib, n_pinned, cold_bytes/mib);
+        if (left_bytes > 0) {
+            LLAMA_LOG_WARN("%s: MoE complement: %.2f MiB left out of RAM, their misses will read the GGUF from disk\n", __func__, left_bytes/mib);
+        }
     }
 
     impl(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size,
-            const std::string & profile_path, bool static_mode_in, int64_t pin_mib, bool cpu_fallback_in) :
-            static_mode(static_mode_in), pin_bytes((int64_t) pin_mib*1024*1024), cpu_fallback(cpu_fallback_in), n_expert_used(model.hparams.n_expert_used_max()), layers(model.layers.size()),
+            const std::string & profile_path, bool static_mode_in, int64_t pin_mib, bool cpu_fallback_in, int32_t tail_skip_in) :
+            static_mode(static_mode_in), pin_bytes((int64_t) pin_mib*1024*1024), cpu_fallback(cpu_fallback_in), tail_skip(tail_skip_in), n_expert_used(model.hparams.n_expert_used_max()), layers(model.layers.size()),
             use(model.layers.size()*model.hparams.n_expert, 0) {
+        if (tail_skip != 0 && (tail_skip < 1 || tail_skip >= n_expert_used)) {
+            LLAMA_LOG_WARN("%s: MoE tail skip needs a rank between 1 and %d, disabled\n", __func__, n_expert_used - 1);
+            tail_skip = 0;
+        }
         for (size_t i = 0; i < backends.size(); ++i) {
             const auto dev_type = ggml_backend_dev_type(ggml_backend_get_device(backends[i]));
             if (dev_type == GGML_BACKEND_DEVICE_TYPE_GPU || dev_type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
@@ -578,9 +714,9 @@ struct llama_moe_cache::impl {
         };
 
         for (group & g : groups) {
-            // with the CPU fallback, slot n_slots is the all-zero slot the GPU reads for an expert the CPU computes,
-            // and one more slot is kept so CUDA reading past it stays inside the buffer
-            g.n_extra = cpu_fallback ? 2 : 1;
+            // with the CPU fallback or a tail skip, slot n_slots is the all-zero slot the GPU reads for an expert it
+            // must not compute, and one more slot is kept so CUDA reading past it stays inside the buffer
+            g.n_extra = (cpu_fallback || tail_skip > 0) ? 2 : 1;
             g.cpu_fallback = cpu_fallback;
         }
 
@@ -631,6 +767,8 @@ struct llama_moe_cache::impl {
                 continue;
             }
             g.lru.init(model.layers.size(), n_expert, g.n_slots);
+            g.lru.tail_skip     = tail_skip;
+            g.lru.n_expert_used = n_expert_used;
             n_tensors[g.id] += g.ref.size()*(1 + g.layers.size());
             n_tensors_host  += g.layers.size()*(cpu_fallback ? 2 : 1);
         }
@@ -929,8 +1067,9 @@ struct llama_moe_cache::impl {
         }
 
         // large batches only read the cache, so the experts used in generation stay in it
+        // a slot of n_slots is the zero slot of a dropped expert, it is not the expert and must not be copied
         const int32_t * slots = g.lru.slot_map[b.il];
-        if (slots == nullptr || slots[e] < 0) {
+        if (slots == nullptr || slots[e] < 0 || slots[e] >= g.n_slots) {
             return 0;
         }
         int64_t n = 1;
@@ -993,20 +1132,28 @@ struct llama_moe_cache::impl {
             // the slot map is static, the experts the CPU computes read the zero slot, so there is nothing to upload
             const int32_t * slots = g.lru.slot_map[il];
             size_t n_gpu = 0;
+            size_t n_skip = 0;
             for (size_t i = 0; i < ids.size(); ++i) {
                 use[(size_t) il*g.lru.n_expert + ids[i]]++;
-                n_gpu += slots[ids[i]] < g.n_slots ? 1 : 0;
+                if (slots[ids[i]] < g.n_slots) {
+                    n_gpu++;
+                }
+                else if (tail_skip > 0 && (int32_t)(i % n_expert_used) >= tail_skip) {
+                    n_skip++;
+                }
             }
             stats & st = ids.size() <= (size_t) 8*n_expert_used ? stats_small : stats_large;
             st.hits   += n_gpu;
             st.misses += ids.size() - n_gpu;
+            st.skipped += n_skip;
             ggml_backend_tensor_set_async(backend, dst, src->data, 0, ggml_nbytes(src));
             return true;
         }
 
         size_t n_hit = 0;
         size_t n_scratch = 0;
-        if (!g.lru.plan(il, ids.data(), ids.size(), fills, n_hit, n_scratch)) {
+        size_t n_skip = 0;
+        if (!g.lru.plan(il, ids.data(), ids.size(), fills, n_hit, n_scratch, n_skip)) {
             GGML_ABORT("the MoE cache is too small for the experts selected in layer %d", il);
         }
 
@@ -1036,6 +1183,7 @@ struct llama_moe_cache::impl {
         st.misses += fills.size();
         st.bytes  += bytes;
         st.scratch += n_scratch;
+        st.skipped += n_skip;
 
         // the next copy synchronizes the backend before it changes the slot map again
         ggml_backend_tensor_set_async(backend, dst, src->data, 0, ggml_nbytes(src));
@@ -1049,8 +1197,8 @@ struct llama_moe_cache::impl {
             if (n == 0) {
                 return;
             }
-            LLAMA_LOG_INFO("llama_moe_cache: %s: hits = %zu, misses = %zu, hit rate = %.2f%%, uploaded = %.2f MiB, scratch = %zu\n",
-                name, st.hits, st.misses, 100.0*st.hits/n, st.bytes/1024.0/1024.0, st.scratch);
+            LLAMA_LOG_INFO("llama_moe_cache: %s: hits = %zu, misses = %zu, hit rate = %.2f%%, uploaded = %.2f MiB, scratch = %zu, skipped = %zu\n",
+                name, st.hits, st.misses, 100.0*st.hits/n, st.bytes/1024.0/1024.0, st.scratch, st.skipped);
         };
         log("ubatch <= 8", stats_small);
         log("ubatch  > 8", stats_large);
@@ -1145,8 +1293,8 @@ struct llama_moe_cache::impl {
 };
 
 llama_moe_cache::llama_moe_cache(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size,
-        const std::string & profile_path, bool static_mode, int64_t pin_mib, bool cpu_fallback) :
-    pimpl(new impl(model, backends, bufts, size, profile_path, static_mode, pin_mib, cpu_fallback)) {
+        const std::string & profile_path, bool static_mode, int64_t pin_mib, bool cpu_fallback, int32_t tail_skip) :
+    pimpl(new impl(model, backends, bufts, size, profile_path, static_mode, pin_mib, cpu_fallback, tail_skip)) {
 }
 
 llama_moe_cache::~llama_moe_cache() = default;
@@ -1161,6 +1309,10 @@ ggml_tensor * llama_moe_cache::get_slot_map(int32_t il, int64_t n_tokens, int64_
 
 ggml_tensor * llama_moe_cache::get_cpu_map(int32_t il) const {
     return pimpl->get_cpu_map(il);
+}
+
+int32_t llama_moe_cache::tail_skip() const {
+    return pimpl->tail_skip;
 }
 
 ggml_tensor * llama_moe_cache::get_experts(const ggml_tensor * w) const {
