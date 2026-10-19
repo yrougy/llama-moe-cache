@@ -1949,6 +1949,12 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
 
         // consecutive accept rounds with low acceptance fraction (< 0.5)
         int n_low = 0;
+
+        // exponential moving average of the accepted / drafted ratio of the recent drafts, -1 = no data yet
+        double acc_ema = -1.0;
+
+        // number of drafts proposed for this sequence, used to probe again periodically when gating
+        uint64_t n_round = 0;
     };
 
     std::vector<seq_info> sinfos;
@@ -1981,6 +1987,8 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
 
         sinfo.i_last = 0;
         sinfo.n_draft_last = 0;
+        sinfo.acc_ema = -1.0;
+        sinfo.n_round = 0;
 
         const size_t n = mod.get_n();
         if (prompt.size() < n) {
@@ -2013,6 +2021,13 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
         const auto & prompt = *dparams.prompt;
 
         sinfo.n_draft_last = 0;
+        sinfo.n_round++;
+
+        // gating: when the recent drafts of this sequence were accepted poorly, stop drafting and probe again every
+        // 16 drafts, so that fresh text only pays a few wasted verify tokens between the probes
+        if (params.min_acc > 0.0f && sinfo.acc_ema >= 0.0 && sinfo.acc_ema < (double) params.min_acc && sinfo.n_round % 16 != 0) {
+            return;
+        }
 
         const size_t cur_len = prompt.size();
         if (cur_len < mod.get_n()) {
@@ -2088,6 +2103,9 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
         // compute acceptance fraction if we have a recorded draft length
         if (sinfo.n_draft_last > 0) {
             const double f_acc = (double)n_accepted / (double)sinfo.n_draft_last;
+
+            sinfo.acc_ema = sinfo.acc_ema < 0.0 ? f_acc : sinfo.acc_ema*0.75 + f_acc*0.25;
+
             if (f_acc < 0.25) {
                 sinfo.n_low++;
                 if (sinfo.n_low >= 5) {

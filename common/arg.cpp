@@ -4392,6 +4392,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.ngram_mod.n_match = value;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--spec-ngram-mod-min-acc"}, "F",
+        string_format("stop drafting with ngram-mod when the accepted / drafted ratio of the recent drafts falls below F, "
+                      "probing again every 16 drafts (default: %g, disabled)", params.speculative.ngram_mod.min_acc),
+        [](common_params & params, const std::string & value) {
+            params.speculative.ngram_mod.min_acc = std::stof(value);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
 
     add_opt(common_arg(
         {"--spec-ngram-simple-size-n"}, "N",

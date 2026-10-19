@@ -359,6 +359,8 @@ struct common_params_speculative_ngram_mod {
 
     int32_t n_max = 64;
     int32_t n_min = 48;
+
+    float min_acc = 0.0f; // skip drafting when the accepted / drafted ratio of the recent drafts falls below this value (0 = disabled)
 };
 
 struct common_params_speculative_ngram_map {
