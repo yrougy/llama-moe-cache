@@ -414,7 +414,7 @@ struct llama_moe_cache::impl {
 
     std::vector<uint64_t> use; // [n_layer*n_expert] selections seen by the copy callback, the runtime routing counts
 
-    int32_t adapt_tokens = 0; // re-rank the resident tier of a static CPU-fallback cache every N cached tokens from the live routing counts, 0 = disabled
+    int32_t adapt_tokens = 0; // re-rank the resident tier of a static cache every N cached tokens from the live routing counts, 0 = disabled
     std::vector<uint64_t> prev_use; // [n_layer*n_expert] selection counts at the previous re-ranking
     std::vector<uint64_t> heat;     // [n_layer*n_expert] exponential moving average of the per-window selection counts, what the tier is ranked by
 
@@ -667,8 +667,8 @@ struct llama_moe_cache::impl {
             tail_skip = 0;
         }
         if (adapt_tokens_in > 0) {
-            if (!static_mode || !cpu_fallback) {
-                LLAMA_LOG_WARN("%s: MoE cache adaptation needs a static cache with the CPU fallback, disabled\n", __func__);
+            if (!static_mode) {
+                LLAMA_LOG_WARN("%s: MoE cache adaptation needs a static cache, disabled\n", __func__);
             } else {
                 adapt_tokens = adapt_tokens_in;
             }
@@ -1118,9 +1118,10 @@ struct llama_moe_cache::impl {
         return n;
     }
 
-    // live re-ranking of the resident tier of a static CPU-fallback cache: the tier follows an exponential moving
+    // live re-ranking of the resident tier of a static cache: the tier follows an exponential moving
     // average of the per-window selection counts, so a workload that drifts from the profile pulls its hot experts
-    // into the bank and pushes the cold ones back to the CPU, while one short noisy window cannot override the seed.
+    // into the bank and pushes the cold ones back to the CPU (or, without the CPU fallback, out to the scratch LRU),
+    // while one short noisy window cannot override the seed.
     // a promoted expert is written into the slot of a demoted one, the maps are updated in place before this batch's
     // slot map is copied to the device, so the batch sees one consistent tier
     void adapt_tier(group & g, ggml_backend_t backend) {
@@ -1278,6 +1279,15 @@ struct llama_moe_cache::impl {
         size_t n_hit = 0;
         size_t n_scratch = 0;
         size_t n_skip = 0;
+        if (adapt_tokens > 0 && il == g.layers.front()) {
+            // the first layer of the group is copied once per cached batch: count the batch's tokens there
+            // re-rank before any layer of this group plans its slots, so every map the batch builds sees the new tier
+            g.adapt_done += ids.size() / n_expert_used;
+            if (g.adapt_done >= adapt_tokens) {
+                g.adapt_done = 0;
+                adapt_tier(g, backend);
+            }
+        }
         if (!g.lru.plan(il, ids.data(), ids.size(), fills, n_hit, n_scratch, n_skip)) {
             GGML_ABORT("the MoE cache is too small for the experts selected in layer %d", il);
         }
