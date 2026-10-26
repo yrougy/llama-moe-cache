@@ -4577,6 +4577,20 @@ llama_token llama_get_sampled_token_ith(llama_context * ctx, int32_t i) {
     return ctx->get_sampled_token_ith(i);
 }
 
+int32_t llama_get_sampled_tokens_range(llama_context * ctx, const int32_t * idxs, int32_t n, llama_token * out) {
+    ctx->synchronize();
+
+    for (int32_t i = 0; i < n; ++i) {
+        const llama_token tok = ctx->get_sampled_token_ith(idxs[i]);
+        if (tok == LLAMA_TOKEN_NULL) {
+            return i;
+        }
+        out[i] = tok;
+    }
+
+    return n;
+}
+
 float * llama_get_sampled_probs_ith(llama_context * ctx, int32_t i) {
     ctx->synchronize();
 
