@@ -10,6 +10,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -333,6 +334,10 @@ struct llama_moe_cache::impl {
         ggml_backend_buffer_type_t buft;
         size_t host_bytes = 0; // host experts of the layers it caches
         double split = 0.0;    // share of the budget
+
+        // H2D upload of the missing experts on a dedicated CUDA stream, resolved from the backend registry
+        // (MOE_UPLOAD_STREAM=1), null = the serial path on the compute stream
+        void (*upload_fn)(void * backend, void * dst, const void * src, size_t size) = nullptr;
 
         // banks and their views
         ggml_context_ptr ctx;
@@ -684,6 +689,11 @@ struct llama_moe_cache::impl {
                 auto & d = devices.emplace_back();
                 d.backend = backends[i];
                 d.buft    = bufts[i];
+                if (getenv("MOE_UPLOAD_STREAM") && !getenv("MOE_UPLOAD_STREAM_DISABLE")) {
+                    auto * reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(d.backend));
+                    d.upload_fn = (decltype(d.upload_fn)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_moe_upload_async");
+                    LLAMA_LOG_INFO("%s: upload stream %s on %s\n", __func__, d.upload_fn ? "enabled" : "unavailable", ggml_backend_name(d.backend));
+                }
             }
         }
         if (devices.empty()) {
@@ -1201,8 +1211,13 @@ struct llama_moe_cache::impl {
                 }
                 for (size_t ip = 0; ip < layers[il].experts.size(); ++ip) {
                     const ggml_tensor * w = layers[il].experts[ip];
-                    ggml_backend_tensor_set_async(backend, g.banks[ip],
-                            (const uint8_t *) w->data + (size_t) e2*w->nb[2], (size_t) s*w->nb[2], w->nb[2]);
+                    if (devices[g.id].upload_fn != nullptr) {
+                        devices[g.id].upload_fn(backend, (uint8_t *) g.banks[ip]->data + (size_t) s*w->nb[2],
+                                (const uint8_t *) w->data + (size_t) e2*w->nb[2], w->nb[2]);
+                    } else {
+                        ggml_backend_tensor_set_async(backend, g.banks[ip],
+                                (const uint8_t *) w->data + (size_t) e2*w->nb[2], (size_t) s*w->nb[2], w->nb[2]);
+                    }
                 }
                 n_swap++;
             }
@@ -1319,6 +1334,13 @@ struct llama_moe_cache::impl {
         // upload the missing experts, consecutive experts going to consecutive slots are uploaded together
         size_t bytes = 0;
         const auto probe_t_upload = std::chrono::steady_clock::now();
+        auto upload = [&](ggml_backend_t backend, ggml_tensor * bank, size_t offset, const uint8_t * src, size_t size) {
+            if (devices[g.id].upload_fn != nullptr) {
+                devices[g.id].upload_fn(backend, (uint8_t *) bank->data + offset, src, size);
+            } else {
+                ggml_backend_tensor_set_async(backend, bank, src, offset, size);
+            }
+        };
         for (size_t ip = 0; ip < l.experts.size(); ++ip) {
             const ggml_tensor * w    = l.experts[ip];
             ggml_tensor       * bank = g.banks[ip];
@@ -1328,7 +1350,7 @@ struct llama_moe_cache::impl {
                 while (i + n < fills.size() && fills[i + n].expert == fills[i].expert + (int32_t) n && fills[i + n].slot == fills[i].slot + (int32_t) n) {
                     n++;
                 }
-                ggml_backend_tensor_set_async(backend, bank, (const uint8_t *) w->data + fills[i].expert*expert_size, fills[i].slot*expert_size, n*expert_size);
+                upload(backend, bank, (size_t) fills[i].slot*expert_size, (const uint8_t *) w->data + (size_t) fills[i].expert*expert_size, n*expert_size);
                 bytes += n*expert_size;
                 i += n;
             }

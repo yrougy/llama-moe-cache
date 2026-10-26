@@ -5994,8 +5994,31 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
+// MoE expert cache: H2D upload of missing experts on a dedicated stream, the compute stream waits on an event
+// recorded after the memcpy, so the DMA overlaps with the kernels of the splits enqueued earlier (and with CUDA
+// graph replays, which are launched on the compute stream after the wait). Registered proc address for llama-moe-cache.
+static cudaStream_t ggml_cuda_moe_upload_stream[GGML_CUDA_MAX_DEVICES] = {};
+static cudaEvent_t  ggml_cuda_moe_upload_event[GGML_CUDA_MAX_DEVICES]  = {};
+
+static void ggml_backend_cuda_moe_upload_async(void * backend_ptr, void * dst, const void * src, size_t size) {
+    ggml_backend_t backend = (ggml_backend_t) backend_ptr;
+    ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *) backend->context;
+    const int device = ctx->device;
+    ggml_cuda_set_device(device);
+    if (ggml_cuda_moe_upload_stream[device] == nullptr) {
+        CUDA_CHECK(cudaStreamCreateWithFlags(&ggml_cuda_moe_upload_stream[device], cudaStreamNonBlocking));
+        CUDA_CHECK(cudaEventCreateWithFlags(&ggml_cuda_moe_upload_event[device], cudaEventDisableTiming));
+    }
+    CUDA_CHECK(cudaMemcpyAsync(dst, src, size, cudaMemcpyHostToDevice, ggml_cuda_moe_upload_stream[device]));
+    CUDA_CHECK(cudaEventRecord(ggml_cuda_moe_upload_event[device], ggml_cuda_moe_upload_stream[device]));
+    CUDA_CHECK(cudaStreamWaitEvent(ctx->stream(), ggml_cuda_moe_upload_event[device], 0));
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_cuda_moe_upload_async") == 0) {
+        return (void *)ggml_backend_cuda_moe_upload_async;
+    }
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_cuda_comm_init;
     }
