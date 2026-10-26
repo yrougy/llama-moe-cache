@@ -1464,18 +1464,32 @@ bool llama_context::set_adapter_cvec(
     return res;
 }
 
-llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
-    if (mctx && !mctx->apply()) {
-        LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
-        ret = GGML_STATUS_FAILED;
-        return nullptr;
-    }
+// stall probe accumulators of the per-ubatch CPU path, streamed as extra columns by graph_compute when MOE_STALL_PROBE is set
+static uint64_t probe_apply_ns = 0, probe_build_ns = 0, probe_setinp_ns = 0;
+
+static uint64_t llama_probe_ns(std::chrono::steady_clock::time_point t0) {
+    return (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
+}
+
+ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+     const bool probe_on = getenv("MOE_STALL_PROBE") != nullptr;
+
+     const auto probe_t_apply0 = std::chrono::steady_clock::now();
+     if (mctx && !mctx->apply()) {
+         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
+         ret = GGML_STATUS_FAILED;
+         return nullptr;
+     }
+     if (probe_on) {
+         probe_apply_ns += llama_probe_ns(probe_t_apply0);
+     }
 
     auto * res = get_gf_res_prev();
     auto * gf  = res->get_gf();
 
     // the new graph parameters
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
+    const auto probe_t_build0 = std::chrono::steady_clock::now();
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
     if (!graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams)) {
@@ -1518,11 +1532,18 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
 
     // set the input data for the input tensors
+    if (probe_on) {
+        probe_build_ns += llama_probe_ns(probe_t_build0);
+    }
     {
         //const auto t_start_us = ggml_time_us();
 
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
+        const auto probe_t_setinp0 = std::chrono::steady_clock::now();
         res->set_inputs(&ubatch);
+        if (probe_on) {
+            probe_setinp_ns += llama_probe_ns(probe_t_setinp0);
+        }
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
@@ -2695,13 +2716,14 @@ ggml_status llama_context::graph_compute(
     static FILE * f_probe = nullptr;
     static bool   probe_init = false;
     static llama_moe_cache_probe probe_prev{};
+    static uint64_t probe_prev_apply = 0, probe_prev_build = 0, probe_prev_setinp = 0;
     if (!probe_init) {
         probe_init = true;
         const char * path = getenv("MOE_STALL_PROBE");
         if (path && *path && moe_cache) {
             f_probe = fopen(path, "a");
             if (f_probe) {
-                fprintf(f_probe, "t_ms,tokens,graph_us,copy_us,sync_us,plan_us,upload_us,adapt_us,uploads,bytes\n");
+                fprintf(f_probe, "t_ms,tokens,graph_us,copy_us,sync_us,plan_us,upload_us,adapt_us,uploads,bytes,apply_us,build_us,setinp_us\n");
                 fflush(f_probe);
             }
         }
@@ -2715,7 +2737,7 @@ ggml_status llama_context::graph_compute(
         const uint64_t graph_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - probe_t0).count();
         const llama_moe_cache_probe s = moe_cache->probe();
         const uint64_t ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
-        fprintf(f_probe, "%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
+        fprintf(f_probe, "%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
                 (unsigned long long) ms,
                 (unsigned long long) (s.tokens   - probe_prev.tokens),
                 (unsigned long long) (graph_ns/1000),
@@ -2725,9 +2747,15 @@ ggml_status llama_context::graph_compute(
                 (unsigned long long) ((s.upload_ns - probe_prev.upload_ns)/1000),
                 (unsigned long long) ((s.adapt_ns - probe_prev.adapt_ns)/1000),
                 (unsigned long long) (s.uploads  - probe_prev.uploads),
-                (unsigned long long) (s.bytes    - probe_prev.bytes));
+                (unsigned long long) (s.bytes    - probe_prev.bytes),
+                (unsigned long long) ((probe_apply_ns  - probe_prev_apply)  /1000),
+                (unsigned long long) ((probe_build_ns  - probe_prev_build)  /1000),
+                (unsigned long long) ((probe_setinp_ns - probe_prev_setinp) /1000));
         fflush(f_probe);
         probe_prev = s;
+        probe_prev_apply  = probe_apply_ns;
+        probe_prev_build  = probe_build_ns;
+        probe_prev_setinp = probe_setinp_ns;
     }
 
     if (status != GGML_STATUS_SUCCESS) {
@@ -4288,6 +4316,20 @@ llama_token llama_get_sampled_token_ith(llama_context * ctx, int32_t i) {
     ctx->synchronize();
 
     return ctx->get_sampled_token_ith(i);
+}
+
+int32_t llama_get_sampled_tokens_range(llama_context * ctx, const int32_t * idxs, int32_t n, llama_token * out) {
+    ctx->synchronize();
+
+    for (int32_t i = 0; i < n; ++i) {
+        const llama_token tok = ctx->get_sampled_token_ith(idxs[i]);
+        if (tok == LLAMA_TOKEN_NULL) {
+            return i;
+        }
+        out[i] = tok;
+    }
+
+    return n;
 }
 
 float * llama_get_sampled_probs_ith(llama_context * ctx, int32_t i) {

@@ -3122,11 +3122,15 @@ private:
     int64_t t_decode      = 0;
     int64_t t_post_decode = 0;
     int64_t t_sampl       = 0;
+    int64_t t_send        = 0;
+    int64_t t_clone       = 0;
     int64_t n_pre_decode  = 0;
     int64_t n_decode      = 0;
     int64_t n_post_decode = 0;
     int64_t n_sampl       = 0;
-// #define DEBUG_TIMINGS
+    int64_t n_send        = 0;
+    int64_t n_clone       = 0;
+//#define DEBUG_TIMINGS   // diagnostics 26/10 measurements done — voir mémoire o35-spec-knob-verdict
 #ifdef DEBUG_TIMINGS
     struct scoped_timer {
         int64_t & t;
@@ -3158,6 +3162,8 @@ private:
             SRV_INF("avg t_decode      = %f ms\n", (double) t_decode / n_decode / 1000.0);
             SRV_INF("avg t_post_decode = %f ms\n", (double) t_post_decode / n_post_decode / 1000.0);
             SRV_INF("avg t_sampl       = %f ms\n", (double) t_sampl / n_sampl / 1000.0);
+            SRV_INF("avg t_send        = %f ms, n_send = %" PRId64 "\n", n_send ? (double) t_send / n_send / 1000.0 : 0.0, n_send);
+            SRV_INF("avg t_clone       = %f ms, n_clone = %" PRId64 "\n", n_clone ? (double) t_clone / n_clone / 1000.0 : 0.0, n_clone);
         }
 #endif
 
@@ -4381,7 +4387,12 @@ private:
                 populate_token_probs(slot, result, slot.task->params.post_sampling_probs, params_base.special, tok_idx);
             }
 
-            if (!process_token(result, slot)) {
+            bool keep_going;
+            {
+                scoped_timer timer(t_send, n_send);
+                keep_going = process_token(result, slot);
+            }
+            if (!keep_going) {
                 // release slot because of stop condition
                 slot.print_timings();
                 send_final_response(slot);
@@ -4407,6 +4418,14 @@ private:
 
             // verify and try to accept the draft
             {
+                scoped_timer timer(t_sampl, n_sampl);
+                scoped_timer timer_clone(t_clone, n_clone);
+                // SAMPL_PROBE=1 : décompose le bloc verify (boucle sample+accept vs restore checkpoint)
+                static double sp_loop_us = 0, sp_ckpt_us = 0; static uint32_t sp_n = 0;
+                static double sp_last_loop = 0, sp_last_ckpt = 0;
+                const bool sp_probe = getenv("SAMPL_PROBE") != nullptr;
+                if (sp_probe && sp_n % 16 == 0) { SLT_INF(slot, "[accept] ENTER sp_probe=1 n=%u draft=%zu\n", sp_n, slot.spec_draft.size()); }
+                const auto sp_t0 = std::chrono::steady_clock::now();
                 common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
@@ -4430,6 +4449,8 @@ private:
                     accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
                 }
                 slot.spec_i_batch.clear();
+
+                const auto sp_t1 = std::chrono::steady_clock::now();
 
                 GGML_ASSERT(accepted.size() >= 1);
 
@@ -4465,6 +4486,17 @@ private:
                         slot.prompt.tokens.keep_first(ckpt.n_tokens);
                         common_sampler_copy(smpl_save.get(), slot.smpl.get());
 
+                        if (sp_probe) {
+                            const auto sp_t2 = std::chrono::steady_clock::now();
+                            sp_last_loop = std::chrono::duration_cast<std::chrono::microseconds>(sp_t1 - sp_t0).count() / 1000.0;
+                            sp_last_ckpt = std::chrono::duration_cast<std::chrono::microseconds>(sp_t2 - sp_t1).count() / 1000.0;
+                            sp_loop_us += sp_last_loop; sp_ckpt_us += sp_last_ckpt;
+                            if (++sp_n % 4 == 0) {
+                                SLT_INF(slot, "[accept] n=%u last loop=%.1f ckpt=%.1f ms | moy loop=%.1f ckpt=%.1f\n",
+                                        sp_n, sp_last_loop, sp_last_ckpt, sp_loop_us / sp_n, sp_ckpt_us / sp_n);
+                            }
+                        }
+
                         return;
                     }
                 }
@@ -4476,9 +4508,21 @@ private:
                 common_speculative_accept(spec.get(), slot.id, accepted.size() - 1);
 
                 slot.spec_draft = std::move(accepted);
+
+                if (sp_probe) {
+                    sp_last_loop = std::chrono::duration_cast<std::chrono::microseconds>(sp_t1 - sp_t0).count() / 1000.0;
+                    sp_last_ckpt = 0.0;
+                    sp_loop_us += sp_last_loop;
+                    if (++sp_n % 4 == 0) {
+                        SLT_INF(slot, "[accept] n=%u last loop=%.1f ckpt=%.1f ms | moy loop=%.1f ckpt=%.1f\n",
+                                sp_n, sp_last_loop, sp_last_ckpt, sp_loop_us / sp_n, (sp_n > 0 ? sp_ckpt_us / sp_n : 0.0));
+                    }
+                }
             }
 
             const auto ids = std::move(slot.spec_draft);
+
+            scoped_timer timer(t_send, n_send);
 
             size_t n_accepted = ids.size() - 1;
             if (slot.spec_is_replay && n_accepted > 0) {

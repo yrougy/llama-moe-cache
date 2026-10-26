@@ -516,11 +516,25 @@ void common_sampler_reset(struct common_sampler * gsmpl) {
 }
 
 struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
+    const bool dbg = getenv("CLONE_PROBE") != nullptr;
+    int64_t t0 = 0, t1 = 0, t2 = 0, t3 = 0;
+    auto now = [] { return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); };
+    if (dbg) { t0 = now(); }
+    auto * grmr = llama_sampler_clone(gsmpl->grmr);
+    if (dbg) { t1 = now(); }
+    auto * rbudget = llama_sampler_clone(gsmpl->rbudget);
+    if (dbg) { t2 = now(); }
+    auto * chain = llama_sampler_clone(gsmpl->chain);
+    if (dbg) {
+        t3 = now();
+        fprintf(stderr, "[clone] grmr %.2f ms, rbudget %.2f ms, chain %.2f ms\n",
+                (t1 - t0)/1e6, (t2 - t1)/1e6, (t3 - t2)/1e6);
+    }
     return new common_sampler {
         /* .params  = */ gsmpl->params,
-        /* .grmr    = */ llama_sampler_clone(gsmpl->grmr),
-        /* .rbudget = */ llama_sampler_clone(gsmpl->rbudget),
-        /* .chain   = */ llama_sampler_clone(gsmpl->chain),
+        /* .grmr    = */ grmr,
+        /* .rbudget = */ rbudget,
+        /* .chain   = */ chain,
         /* .prev    = */ gsmpl->prev,
         /* .cur     = */ gsmpl->cur,
         /* .cur_p   = */ gsmpl->cur_p,
@@ -694,9 +708,58 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 
     const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
 
+    // SPEC_FAST_ACCEPT=1 : chemin rapide - quand le sampler backend (in-graph GPU) a échantillonné
+    // toutes les positions, on prefetche les tokens en UNE synchronisation au lieu de ~7 par position
+    // (llama_synchronize + set_logits + getters). Sans grmr ni rbudget (backend sampling les exclut,
+    // cf. GGML_ASSERT dans common_sampler_sample), l'acceptation est identique jeton par jeton.
+    static const bool fast_accept = getenv("SPEC_FAST_ACCEPT") != nullptr;
+    if (fast_accept && !grammar_first && !gsmpl->grmr && !gsmpl->rbudget) {
+        std::vector<llama_token> ids(idxs.size());
+        const int32_t n_ids = llama_get_sampled_tokens_range(ctx, idxs.data(), (int32_t) idxs.size(), ids.data());
+
+        if (n_ids == (int32_t) idxs.size()) {
+            size_t i = 0;
+            for (; i < draft.size(); i++) {
+                const llama_token id = ids[i];
+
+                common_sampler_accept(gsmpl, id, true);
+
+                result.push_back(id);
+
+                if (draft[i] != id || (llama_vocab_is_eog(vocab, id) && i + 1 < draft.size())) {
+                    break;
+                }
+            }
+
+            if (i == draft.size()) {
+                const llama_token id = ids[i];
+
+                common_sampler_accept(gsmpl, id, true);
+
+                result.push_back(id);
+            }
+
+            return result;
+        }
+    }
+
     size_t i = 0;
+
+    // SPEC_ACCEPT_TRC=1 : coût de la 1re position (pull D2H global) vs positions suivantes
+    static double sat_first = 0, sat_rest = 0; static size_t sat_n = 0, sat_pos = 0;
+    static std::chrono::steady_clock::time_point sat_last;
+    const bool sat_trc = getenv("SPEC_ACCEPT_TRC") != nullptr;
+    const auto sat_t0 = std::chrono::steady_clock::now();
+
     for (; i < draft.size(); i++) {
         const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+
+        if (sat_trc) {
+            const auto sat_t1 = std::chrono::steady_clock::now();
+            const double dt = std::chrono::duration_cast<std::chrono::microseconds>(sat_t1 - (i == 0 ? sat_t0 : sat_last)).count() / 1000.0;
+            if (i == 0) { sat_first += dt; } else { sat_rest += dt; }
+            sat_last = sat_t1;
+        }
 
         common_sampler_accept(gsmpl, id, true);
 
@@ -712,9 +775,23 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
     if (i == draft.size()) {
         const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
 
+        if (sat_trc) {
+            const auto sat_t1 = std::chrono::steady_clock::now();
+            sat_rest += std::chrono::duration_cast<std::chrono::microseconds>(sat_t1 - sat_last).count() / 1000.0;
+            sat_last = sat_t1;
+        }
+
         common_sampler_accept(gsmpl, id, true);
 
         result.push_back(id);
+    }
+
+    if (sat_trc) {
+        sat_n++; sat_pos += i + 1;
+        if (sat_n % 16 == 0) {
+            fprintf(stderr, "[acceptn] n=%zu pos=%zu first=%.1f ms/round rest=%.3f ms/pos\n",
+                    sat_n, sat_pos / sat_n, sat_first / sat_n, sat_rest / (sat_pos - sat_n));
+        }
     }
 
     return result;

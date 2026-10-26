@@ -1195,6 +1195,11 @@ extern "C" {
     // Returns LLAMA_TOKEN_NULL if no token was sampled.
     LLAMA_API llama_token llama_get_sampled_token_ith(struct llama_context * ctx, int32_t i);
 
+    // Batched fetch of backend sampled tokens for multiple indices - a single context sync for the whole
+    // range. Writes up to n tokens into out[], stopping at the first index without a sampled token.
+    // Returns the number of tokens written (0 if the first index has no backend-sampled token).
+    LLAMA_API int32_t llama_get_sampled_tokens_range(struct llama_context * ctx, const int32_t * idxs, int32_t n, llama_token * out);
+
     // Get the backend sampled probabilities for the ith token
     // The index matches llama_get_sampled_token_ith().
     // Returns NULL if no probabilities were generated.
