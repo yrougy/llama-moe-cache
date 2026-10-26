@@ -7,6 +7,7 @@
 #include "ggml-cpp.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -402,6 +403,8 @@ struct llama_moe_cache::impl {
     stats stats_small; // up to 8 tokens per ubatch
     stats stats_large;
     stats stats_copy;  // experts copied from the cache for large batches
+
+    llama_moe_cache_probe probe_cur; // cumulative copy-callback stalls, see llama_moe_cache_probe
 
     std::vector<device> devices;
     std::vector<group> groups;
@@ -1210,6 +1213,11 @@ struct llama_moe_cache::impl {
     }
 
     bool copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph) {
+        const auto probe_t0 = std::chrono::steady_clock::now();
+        auto probe_ns = [](std::chrono::steady_clock::time_point t0) {
+            return (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
+        };
+
         const auto it = layer_of.find(src);
         if (it == layer_of.end()) {
             return false;
@@ -1243,8 +1251,10 @@ struct llama_moe_cache::impl {
         GGML_ASSERT(ggml_is_contiguous(sel));
 
         ids.resize(ggml_nelements(sel));
+        const auto probe_t_sync = std::chrono::steady_clock::now();
         ggml_backend_tensor_get_async(backend, sel, ids.data(), 0, ggml_nbytes(sel));
         ggml_backend_synchronize(backend);
+        probe_cur.sync_ns += probe_ns(probe_t_sync);
 
         if (g.cpu_fallback) {
             // the slot map is static, the experts the CPU computes read the zero slot, so there is nothing to upload
@@ -1262,16 +1272,21 @@ struct llama_moe_cache::impl {
             }
             if (adapt_tokens > 0 && il == g.layers.front()) {
                 // the first layer of the group is copied once per cached batch: count the batch's tokens there
+                probe_cur.tokens += ids.size() / n_expert_used;
                 g.adapt_done += ids.size() / n_expert_used;
                 if (g.adapt_done >= adapt_tokens) {
                     g.adapt_done = 0;
+                    const auto probe_t_adapt = std::chrono::steady_clock::now();
                     adapt_tier(g, backend);
+                    probe_cur.adapt_ns += probe_ns(probe_t_adapt);
                 }
             }
             stats & st = ids.size() <= (size_t) 8*n_expert_used ? stats_small : stats_large;
             st.hits   += n_gpu;
             st.misses += ids.size() - n_gpu;
             st.skipped += n_skip;
+            probe_cur.copy_ns += probe_ns(probe_t0);
+            probe_cur.copies++;
             ggml_backend_tensor_set_async(backend, dst, src->data, 0, ggml_nbytes(src));
             return true;
         }
@@ -1282,15 +1297,20 @@ struct llama_moe_cache::impl {
         if (adapt_tokens > 0 && il == g.layers.front()) {
             // the first layer of the group is copied once per cached batch: count the batch's tokens there
             // re-rank before any layer of this group plans its slots, so every map the batch builds sees the new tier
+            probe_cur.tokens += ids.size() / n_expert_used;
             g.adapt_done += ids.size() / n_expert_used;
             if (g.adapt_done >= adapt_tokens) {
                 g.adapt_done = 0;
+                const auto probe_t_adapt = std::chrono::steady_clock::now();
                 adapt_tier(g, backend);
+                probe_cur.adapt_ns += probe_ns(probe_t_adapt);
             }
         }
+        const auto probe_t_plan = std::chrono::steady_clock::now();
         if (!g.lru.plan(il, ids.data(), ids.size(), fills, n_hit, n_scratch, n_skip)) {
             GGML_ABORT("the MoE cache is too small for the experts selected in layer %d", il);
         }
+        probe_cur.plan_ns += probe_ns(probe_t_plan);
 
         for (size_t i = 0; i < ids.size(); ++i) {
             use[(size_t) il*g.lru.n_expert + ids[i]]++;
@@ -1298,6 +1318,7 @@ struct llama_moe_cache::impl {
 
         // upload the missing experts, consecutive experts going to consecutive slots are uploaded together
         size_t bytes = 0;
+        const auto probe_t_upload = std::chrono::steady_clock::now();
         for (size_t ip = 0; ip < l.experts.size(); ++ip) {
             const ggml_tensor * w    = l.experts[ip];
             ggml_tensor       * bank = g.banks[ip];
@@ -1313,12 +1334,19 @@ struct llama_moe_cache::impl {
             }
         }
 
+        probe_cur.upload_ns += probe_ns(probe_t_upload);
+        probe_cur.uploads   += fills.size();
+        probe_cur.bytes     += bytes;
+
         stats & st = ids.size() <= (size_t) 8*n_expert_used ? stats_small : stats_large;
         st.hits   += n_hit;
         st.misses += fills.size();
         st.bytes  += bytes;
         st.scratch += n_scratch;
         st.skipped += n_skip;
+
+        probe_cur.copy_ns += probe_ns(probe_t0);
+        probe_cur.copies++;
 
         // the next copy synchronizes the backend before it changes the slot map again
         ggml_backend_tensor_set_async(backend, dst, src->data, 0, ggml_nbytes(src));
@@ -1460,6 +1488,10 @@ bool llama_moe_cache::copy(ggml_backend_t backend, const ggml_tensor * src, ggml
 
 int64_t llama_moe_cache::copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last) {
     return pimpl->copy_experts(backend, w, dst, e, last);
+}
+
+llama_moe_cache_probe llama_moe_cache::probe() const {
+    return pimpl->probe_cur;
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_moe_cache::memory_breakdown() const {

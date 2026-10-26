@@ -2,12 +2,28 @@
 
 #include "ggml-backend.h"
 
+#include <cstdint>
 #include <map>
 #include <memory>
 #include <string>
 #include <vector>
 
 struct llama_model;
+
+// cumulative probe counters of the MoE cache copy callback, streamed to CSV by llama_context
+// when the env var MOE_STALL_PROBE names a file: sync is the ids D2H drain, upload the enqueue
+// of the missing experts on the compute stream, tokens counts the cached batches' tokens
+struct llama_moe_cache_probe {
+    uint64_t tokens   = 0;
+    uint64_t copies   = 0;
+    uint64_t sync_ns  = 0;
+    uint64_t plan_ns  = 0;
+    uint64_t upload_ns = 0;
+    uint64_t adapt_ns = 0;
+    uint64_t copy_ns  = 0;
+    uint64_t uploads  = 0;
+    uint64_t bytes    = 0;
+};
 
 // keeps the most recently used experts of host-resident MoE layers in a device buffer
 // each layer has a slot map in host memory: when the scheduler copies it to the device, the copy callback uploads the missing experts
@@ -51,6 +67,9 @@ public:
 
     // write the per (layer, expert) selection counts and residency to a CSV file
     void export_stats(const std::string & path) const;
+
+    // cumulative probe counters, see llama_moe_cache_probe
+    llama_moe_cache_probe probe() const;
 
 private:
     struct impl;

@@ -15,7 +15,10 @@
 #include "llama.h"
 
 #include <cinttypes>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -2687,7 +2690,46 @@ ggml_status llama_context::graph_compute(
 
     copy_experts.reset();
 
+    // stall probe: stream one CSV row per graph compute when MOE_STALL_PROBE names a file, deltas of the MoE cache
+    // copy-callback counters vs the wall time of the compute, rows with tokens>0 are cached (decode) batches
+    static FILE * f_probe = nullptr;
+    static bool   probe_init = false;
+    static llama_moe_cache_probe probe_prev{};
+    if (!probe_init) {
+        probe_init = true;
+        const char * path = getenv("MOE_STALL_PROBE");
+        if (path && *path && moe_cache) {
+            f_probe = fopen(path, "a");
+            if (f_probe) {
+                fprintf(f_probe, "t_ms,tokens,graph_us,copy_us,sync_us,plan_us,upload_us,adapt_us,uploads,bytes\n");
+                fflush(f_probe);
+            }
+        }
+    }
+
+    const auto probe_t0 = std::chrono::steady_clock::now();
+
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
+
+    if (f_probe) {
+        const uint64_t graph_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - probe_t0).count();
+        const llama_moe_cache_probe s = moe_cache->probe();
+        const uint64_t ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+        fprintf(f_probe, "%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
+                (unsigned long long) ms,
+                (unsigned long long) (s.tokens   - probe_prev.tokens),
+                (unsigned long long) (graph_ns/1000),
+                (unsigned long long) ((s.copy_ns  - probe_prev.copy_ns)/1000),
+                (unsigned long long) ((s.sync_ns  - probe_prev.sync_ns)/1000),
+                (unsigned long long) ((s.plan_ns  - probe_prev.plan_ns)/1000),
+                (unsigned long long) ((s.upload_ns - probe_prev.upload_ns)/1000),
+                (unsigned long long) ((s.adapt_ns - probe_prev.adapt_ns)/1000),
+                (unsigned long long) (s.uploads  - probe_prev.uploads),
+                (unsigned long long) (s.bytes    - probe_prev.bytes));
+        fflush(f_probe);
+        probe_prev = s;
+    }
+
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
     }
